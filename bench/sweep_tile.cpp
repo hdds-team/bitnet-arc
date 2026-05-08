@@ -259,44 +259,28 @@ const char* mode_name(kernel_v0_inner_mode m) {
 
 } /* anonymous namespace */
 
-int main(int argc, char** argv) {
-    std::size_t  M = 16, N = 64, K = 14336;
-    std::uint32_t seed = 1337;
-    unsigned     warmup = 3, timed = 10;
-    bool         emit_header = true;
+struct shape_t {
+    std::size_t M;
+    std::size_t N;
+    std::size_t K;
+};
 
-    for (int i = 1; i < argc; ++i) {
-        const std::string a = argv[i];
-        const auto next = [&](std::size_t& dst) {
-            if (i + 1 < argc) dst = static_cast<std::size_t>(std::atoll(argv[++i]));
-        };
-        const auto nextu = [&](unsigned& dst) {
-            if (i + 1 < argc) dst = static_cast<unsigned>(std::atoi(argv[++i]));
-        };
-        if      (a == "--M")        next(M);
-        else if (a == "--N")        next(N);
-        else if (a == "--K")        next(K);
-        else if (a == "--seed")     { if (i + 1 < argc) seed = static_cast<std::uint32_t>(std::atoi(argv[++i])); }
-        else if (a == "--warmup")   nextu(warmup);
-        else if (a == "--timed")    nextu(timed);
-        else if (a == "--no-header") emit_header = false;
-        else if (a == "--help") {
-            std::printf(
-                "usage: %s [--M N] [--N N] [--K N] [--seed N] "
-                "[--warmup N] [--timed N] [--no-header]\n",
-                argv[0]);
-            return 0;
-        }
-    }
-
+/* Run one shape: regenerate fixtures, allocate USM, sweep all variants,
+ * emit one CSV row per ran variant. Header is the caller's responsibility. */
+int run_shape(const shape_t& sh,
+              std::uint32_t  seed,
+              unsigned       warmup,
+              unsigned       timed)
+{
+    const std::size_t M = sh.M, N = sh.N, K = sh.K;
     if (K % 256 != 0) {
-        std::fprintf(stderr, "K=%zu must be a multiple of 256\n", K);
+        std::fprintf(stderr, "skip shape M=%zu N=%zu K=%zu: K not multiple of 256\n",
+                     M, N, K);
         return 2;
     }
 
     std::mt19937 rng(seed);
 
-    /* --- host fixtures --- */
     std::vector<int8_t>   ternary(K * N);
     std::vector<uint16_t> A_fp16(M * K);
     gen_ternary_weights(ternary, rng);
@@ -308,43 +292,29 @@ int main(int argc, char** argv) {
     std::vector<float> C_ref;
     compute_fp32_ref(C_ref, A_fp16, ternary, M, N, K);
 
-    /* --- SYCL setup --- */
     sycl::queue q(sycl::default_selector_v,
                   sycl::property::queue::in_order{});
     sycl_queue_handle q_handle(q);
-    {
-        const sycl::device d = q.get_device();
-        std::fprintf(stderr,
-                     "device: %s (%s)\n",
-                     d.get_info<sycl::info::device::name>().c_str(),
-                     d.get_info<sycl::info::device::vendor>().c_str());
-    }
 
-    /* --- USM device allocations --- */
-    const std::size_t a_bytes  = M * K * sizeof(uint16_t);
-    const std::size_t b_bytes  = B_blocks.size() * sizeof(bitnet_arc_tq2_0_block);
+    const std::size_t a_bytes = M * K * sizeof(uint16_t);
+    const std::size_t b_bytes = B_blocks.size() * sizeof(bitnet_arc_tq2_0_block);
 
     auto* A_dev = sycl::malloc_device<uint16_t>(M * K, q);
     auto* B_dev = sycl::malloc_device<bitnet_arc_tq2_0_block>(B_blocks.size(), q);
     auto* C_dev = sycl::malloc_device<uint16_t>(M * N, q);
     if (!A_dev || !B_dev || !C_dev) {
-        std::fprintf(stderr, "USM allocation failed\n");
+        std::fprintf(stderr, "USM allocation failed for shape M=%zu N=%zu K=%zu\n",
+                     M, N, K);
+        if (A_dev) sycl::free(A_dev, q);
+        if (B_dev) sycl::free(B_dev, q);
+        if (C_dev) sycl::free(C_dev, q);
         return 3;
     }
 
     q.memcpy(A_dev, A_fp16.data(),   a_bytes).wait();
     q.memcpy(B_dev, B_blocks.data(), b_bytes).wait();
-    /* C is written by the kernel, no upload needed. */
 
     std::vector<uint16_t> C_host(M * N, 0);
-
-    /* --- sweep --- */
-    if (emit_header) {
-        std::printf(
-            "variant,M,N,K,tile_M,tile_N,sg_size,mode,"
-            "time_ms_med,time_ms_min,bytes,bandwidth_gbs,"
-            "correct,max_rel_err,over_threshold\n");
-    }
 
     for (std::size_t i = 0; i < kv0_variants_count; ++i) {
         const kernel_variant_desc& v = kv0_variants[i];
@@ -386,4 +356,124 @@ int main(int argc, char** argv) {
     sycl::free(B_dev, q);
     sycl::free(C_dev, q);
     return 0;
+}
+
+/* Parse "M,N,K" into a shape. Returns false on malformed input. */
+bool parse_shape(const std::string& s, shape_t& out) {
+    std::size_t p1 = s.find(',');
+    if (p1 == std::string::npos) return false;
+    std::size_t p2 = s.find(',', p1 + 1);
+    if (p2 == std::string::npos) return false;
+    out.M = static_cast<std::size_t>(std::atoll(s.substr(0,        p1     ).c_str()));
+    out.N = static_cast<std::size_t>(std::atoll(s.substr(p1 + 1, p2 - p1 - 1).c_str()));
+    out.K = static_cast<std::size_t>(std::atoll(s.substr(p2 + 1            ).c_str()));
+    return out.M > 0 && out.N > 0 && out.K > 0;
+}
+
+int main(int argc, char** argv) {
+    /* Single-shape back-compat path: --M / --N / --K still work. */
+    std::size_t  legacy_M = 0, legacy_N = 0, legacy_K = 0;
+    bool         legacy_used = false;
+
+    std::vector<shape_t> shapes;
+    std::uint32_t seed   = 1337;
+    unsigned      warmup = 3, timed = 10;
+    bool          emit_header = true;
+
+    auto add_preset_llm = [&]() {
+        shapes.push_back({16, 16,    256});  /* k256 floor                */
+        shapes.push_back({16, 64,   4096});  /* LLaMA-7B attention proj   */
+        shapes.push_back({16, 64,  14336});  /* LLaMA-8B FFN intermediate */
+        shapes.push_back({64, 64,  14336});  /* unblocks tile_M=32 sweep  */
+    };
+
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        const auto next_sz = [&](std::size_t& dst) {
+            if (i + 1 < argc) dst = static_cast<std::size_t>(std::atoll(argv[++i]));
+        };
+        const auto next_u = [&](unsigned& dst) {
+            if (i + 1 < argc) dst = static_cast<unsigned>(std::atoi(argv[++i]));
+        };
+        if      (a == "--M")        { next_sz(legacy_M); legacy_used = true; }
+        else if (a == "--N")        { next_sz(legacy_N); legacy_used = true; }
+        else if (a == "--K")        { next_sz(legacy_K); legacy_used = true; }
+        else if (a == "--shape") {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "--shape requires M,N,K argument\n");
+                return 2;
+            }
+            shape_t sh{};
+            if (!parse_shape(argv[++i], sh)) {
+                std::fprintf(stderr, "bad --shape '%s' (expected M,N,K)\n",
+                             argv[i]);
+                return 2;
+            }
+            shapes.push_back(sh);
+        }
+        else if (a == "--shapes-preset") {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "--shapes-preset requires preset name\n");
+                return 2;
+            }
+            const std::string preset = argv[++i];
+            if (preset == "llm") {
+                add_preset_llm();
+            } else {
+                std::fprintf(stderr, "unknown preset '%s' (known: llm)\n",
+                             preset.c_str());
+                return 2;
+            }
+        }
+        else if (a == "--seed")      { if (i + 1 < argc) seed = static_cast<std::uint32_t>(std::atoi(argv[++i])); }
+        else if (a == "--warmup")    next_u(warmup);
+        else if (a == "--timed")     next_u(timed);
+        else if (a == "--no-header") emit_header = false;
+        else if (a == "--help") {
+            std::printf(
+                "usage: %s [--shape M,N,K]... | [--M N --N N --K N] | [--shapes-preset llm]\n"
+                "          [--seed N] [--warmup N] [--timed N] [--no-header]\n"
+                "  default shape: 16,64,14336 (LLaMA-8B FFN smoke)\n"
+                "  preset 'llm':  k256, k4096-attn, k14336-ffn-M16, k14336-M64\n",
+                argv[0]);
+            return 0;
+        }
+    }
+
+    /* Resolve shape source: explicit --shape wins, then legacy --M/--N/--K,
+     * else default smoke (16,64,14336) for back-compat with smoke baseline. */
+    if (shapes.empty()) {
+        if (legacy_used) {
+            shapes.push_back({legacy_M ? legacy_M : 16,
+                              legacy_N ? legacy_N : 64,
+                              legacy_K ? legacy_K : 14336});
+        } else {
+            shapes.push_back({16, 64, 14336});
+        }
+    }
+
+    /* SYCL device probe (once, not per-shape). */
+    {
+        sycl::queue q(sycl::default_selector_v);
+        const sycl::device d = q.get_device();
+        std::fprintf(stderr,
+                     "device: %s (%s)\n",
+                     d.get_info<sycl::info::device::name>().c_str(),
+                     d.get_info<sycl::info::device::vendor>().c_str());
+    }
+
+    if (emit_header) {
+        std::printf(
+            "variant,M,N,K,tile_M,tile_N,sg_size,mode,"
+            "time_ms_med,time_ms_min,bytes,bandwidth_gbs,"
+            "correct,max_rel_err,over_threshold\n");
+        std::fflush(stdout);
+    }
+
+    int worst_rc = 0;
+    for (const shape_t& sh : shapes) {
+        const int rc = run_shape(sh, seed, warmup, timed);
+        if (rc != 0 && worst_rc == 0) worst_rc = rc;
+    }
+    return worst_rc;
 }

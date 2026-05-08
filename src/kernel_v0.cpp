@@ -204,6 +204,12 @@ static void kv0_launch_impl(sycl_queue_handle& q_handle,
  *   inner mode   : (16x16) sg=16, branchless
  *   subgroup     : (16x16) sg=32, branchful
  *
+ * Extension W1.5 (3 added):
+ *   inner-mode  : (32x16) (16x32) (32x32) at sg=16, branchless
+ *   -- confirms that the BRANCHLESS win observed at 16x16 generalizes
+ *   to non-square and larger tiles. 64x64 is intentionally skipped:
+ *   work-group of 4096 items exceeds Intel Xe max WG size (1024).
+ *
  * To extend the sweep, add rows here and rebuild. Compile time scales
  * roughly linearly with row count.
  */
@@ -214,7 +220,10 @@ static void kv0_launch_impl(sycl_queue_handle& q_handle,
     X(16, 32, 16, BRANCHFUL)                  \
     X(32, 32, 16, BRANCHFUL)                  \
     X(16, 16, 16, BRANCHLESS)                 \
-    X(16, 16, 32, BRANCHFUL)
+    X(16, 16, 32, BRANCHFUL)                  \
+    X(32, 16, 16, BRANCHLESS)                 \
+    X(16, 32, 16, BRANCHLESS)                 \
+    X(32, 32, 16, BRANCHLESS)
 
 #define KV0_DEFINE_LAUNCHER(TM, TN, SG, MODE)                            \
     static void kv0_launch_##TM##_##TN##_##SG##_##MODE(                  \

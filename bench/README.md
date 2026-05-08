@@ -117,6 +117,53 @@ Observations:
   must therefore use *relative* targets (each variant >=1.5x faster
   than baseline), not absolute fractions of HBM peak.
 
+## Multi-shape baseline (W1.5, Arc Pro B60, 2026-05-08)
+
+Extended sweep with 9 variants (added `32x16`, `16x32`, `32x32`
+BRANCHLESS rows) across 4 shapes via `./sweep_tile --shapes-preset
+llm`. Saved to `sweep_w15_llm_baseline.csv`. Best per shape:
+
+| Shape (M, N, K)    | best BF (ms / GB/s)    | best BL (ms / GB/s)     | BL/BF |
+|--------------------|------------------------|-------------------------|-------|
+| (16,  16,    256)  | 0.140 / 0.07           | **0.084** / 0.12        | 1.66x |
+| (16,  64,   4096)  | 1.135 / 0.18 (sg32)    | **0.629** / 0.32        | 1.81x |
+| (16,  64,  14336)  | 3.717 / 0.19           | **2.170** / 0.32        | 1.71x |
+| (64,  64,  14336)  | 4.013 / 0.51 (32x16)   | **2.187** / 0.95        | 1.83x |
+
+Findings:
+
+1. **BRANCHLESS wins universally** on all 4 shapes. The 1.7x smoke
+   result is structural, not a fluke. BRANCHLESS becomes the
+   designated v1 baseline candidate (gate_w1w2.py default still
+   tracks `16x16_sg16_BRANCHFUL` per the design v0 narrative; that
+   choice is up for review #65).
+2. **Tile size is irrelevant for BRANCHLESS at small M.** `16x16_BL`
+   ties or beats `32x32_BL` at every shape that runs both. The win
+   is the inner-loop mode, not the work distribution.
+3. **`sg=32` is shape-dependent**: pulls ahead at K=4096 (1.135ms vs
+   1.898ms for sg16 BRANCHFUL) but loses at K=14336. Suggests an
+   interaction with the K-dim memory access pattern. Hold this
+   parameter back until kernel v1 lands SLM tiling.
+4. **Bandwidth scales with M**: 0.32 GB/s at M=16 vs 0.95 GB/s at
+   M=64 (same K). The kernel is weight-load bound for thin batches:
+   each weight block is loaded once per output row, so amortizing
+   across more rows directly buys bandwidth. Kernel v1 must keep
+   this property and reuse weights across the workgroup.
+5. **0.21% peak at the best point** (16x16_BL on (64,64,14336)) is
+   still a long way from HBM saturation. The gap is the kernel v1
+   target: SLM tiling + coalesced loads should bring this to
+   single-digit % at constant correctness.
+
+```bash
+# Reproduce:
+./sweep_tile --shapes-preset llm > sweep_w15_llm_baseline.csv 2>&1
+python3 gate_w1w2.py sweep_w15_llm_baseline.csv
+# Result: 0 errors, 15 warnings (all expected: soft_peak + W2 regressions on BRANCHFUL).
+
+# Add custom shapes:
+./sweep_tile --shape 32,32,4096 --shape 64,128,14336
+```
+
 ---
 
 # `gate_w1w2.py` -- #147 stop-gate (dry-run by default)

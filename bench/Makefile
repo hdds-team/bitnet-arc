@@ -51,6 +51,13 @@ run: harness_3way
 run-sweep: sweep_tile
 	./sweep_tile
 
+# W1.5 multi-shape sweep over the LLM-relevant shapes (k256, k4096-attn,
+# k14336-FFN-M16, k14336-M64). Output goes to sweep_w15_llm_baseline.csv
+# (overwrites). Run on a SYCL-visible device (Arc Pro B60).
+run-sweep-llm: sweep_tile
+	./sweep_tile --shapes-preset llm > sweep_w15_llm_baseline.csv 2>&1
+	@echo "wrote sweep_w15_llm_baseline.csv"
+
 # #147 stop-gate: parses a sweep CSV and emits the W1/W2 report.
 # Default GATE_CSV picks up the smoke baseline; override on the
 # command line: `make gate GATE_CSV=path/to/run.csv`.
@@ -64,4 +71,4 @@ gate-strict:
 clean:
 	rm -f harness_3way sweep_tile
 
-.PHONY: clean run run-sweep gate gate-strict
+.PHONY: clean run run-sweep run-sweep-llm gate gate-strict
