@@ -294,7 +294,25 @@ static void kv1_launch_impl(sycl_queue_handle& q_handle,
     X(32, 16, 16, 256)                    \
     X(16, 32, 16, 256)                    \
     X(32, 32, 16, 256)                    \
-    X(32, 32, 32, 256)
+    X(32, 32, 32, 256)                    \
+    /* Phase 2a (task #153): K_CHUNK=512                              */ \
+    /* tests H2 (barrier overhead) -- 28 barrier-pairs at K=14336    */ \
+    /* instead of 56 with K_CHUNK=256.                                */ \
+    X(16, 16, 16, 512)                    \
+    X(32, 16, 16, 512)                    \
+    X(16, 32, 16, 512)                    \
+    X(32, 32, 16, 512)                    \
+    X(32, 32, 32, 512)                    \
+    /* Phase 2a (task #153): K_CHUNK=1024                             */ \
+    /* tests H2 fully -- 14 barrier-pairs at K=14336 (4x fewer than  */ \
+    /* the K_CHUNK=256 baseline). Variants are skipped at run time on */ \
+    /* shapes where K % 1024 != 0 (e.g. (16,16,256)) via sweep_tile's */ \
+    /* K%K_CHUNK guard.                                                */ \
+    X(16, 16, 16, 1024)                   \
+    X(32, 16, 16, 1024)                   \
+    X(16, 32, 16, 1024)                   \
+    X(32, 32, 16, 1024)                   \
+    X(32, 32, 32, 1024)
 
 #define KV1_DEFINE_LAUNCHER(TM, TN, SG, KC)                              \
     static void kv1_launch_##TM##_##TN##_##SG##_##KC(                    \

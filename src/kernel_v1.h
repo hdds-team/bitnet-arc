@@ -119,16 +119,29 @@ struct kv1_variant_desc {
     kv1_launch_fn  launch;
 };
 
-/* Registered variants. Phase 1 (this drop) ships K_CHUNK=256 only:
- *   v1_16x16_sg16_k256
- *   v1_32x16_sg16_k256
- *   v1_16x32_sg16_k256
- *   v1_32x32_sg16_k256
- *   v1_32x32_sg32_k256
+/* Registered variants. Phase 1 + 2a (15 entries):
  *
- * Phase 2 (incremental, follow-up commit) adds K_CHUNK=512 and 1024
- * for the same five tile/sg combos -- 10 more entries. The X-macro
- * pattern in kernel_v1.cpp scales linearly. */
+ *   K_CHUNK=256 (phase 1, commit b3179af):
+ *     v1_16x16_sg16_k256
+ *     v1_32x16_sg16_k256
+ *     v1_16x32_sg16_k256
+ *     v1_32x32_sg16_k256
+ *     v1_32x32_sg32_k256
+ *
+ *   K_CHUNK=512 (phase 2a, task #153):
+ *     v1_<TM>x<TN>_sg<SG>_k512   (5 entries, same tile/sg combos)
+ *
+ *   K_CHUNK=1024 (phase 2a, task #153):
+ *     v1_<TM>x<TN>_sg<SG>_k1024  (5 entries, same tile/sg combos)
+ *
+ * Phase 2a tests hypothesis H2 (barrier overhead): K_CHUNK=1024 has
+ * 4x fewer barrier-pairs than K_CHUNK=256 at K=14336. If the gain is
+ * insignificant, H2 is not the dominant factor and the bottleneck
+ * lies in the cooperative-load access pattern (tested separately by
+ * phase 2b / task #154 -- two-pass coalesced load).
+ *
+ * Variants with K not a multiple of K_CHUNK are skipped at sweep
+ * runtime (e.g. K_CHUNK=512 and 1024 skip on shape (16,16,256)). */
 extern const kv1_variant_desc kv1_variants[];
 extern const std::size_t      kv1_variants_count;
 
