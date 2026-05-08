@@ -51,7 +51,17 @@ run: harness_3way
 run-sweep: sweep_tile
 	./sweep_tile
 
+# #147 stop-gate: parses a sweep CSV and emits the W1/W2 report.
+# Default GATE_CSV picks up the smoke baseline; override on the
+# command line: `make gate GATE_CSV=path/to/run.csv`.
+GATE_CSV ?= sweep_w1_smoke_baseline.csv
+gate:
+	python3 gate_w1w2.py $(GATE_CSV)
+
+gate-strict:
+	python3 gate_w1w2.py --strict-gates $(GATE_CSV)
+
 clean:
 	rm -f harness_3way sweep_tile
 
-.PHONY: clean run run-sweep
+.PHONY: clean run run-sweep gate gate-strict

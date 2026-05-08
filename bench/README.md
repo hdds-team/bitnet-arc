@@ -8,7 +8,9 @@ Three-voice correctness harness for the bitnet-arc oracle, per
 | File              | Role                                            |
 |-------------------|-------------------------------------------------|
 | `harness_3way.cpp`| Main harness (v1 / v2 / v3 cross-check)         |
-| `Makefile`        | Builds against `oracle/liboracle.a`             |
+| `sweep_tile.cpp`  | #148 tile sweep over `kv0_variants[]` (CSV out) |
+| `gate_w1w2.py`    | #147 stop-gate over a sweep CSV (dry-run)       |
+| `Makefile`        | Builds harness + sweep, runs gate via Python    |
 
 ## Voices and gates
 
@@ -114,3 +116,69 @@ Observations:
   precisely to make this gap visible. Stop-gates calibration (#147)
   must therefore use *relative* targets (each variant >=1.5x faster
   than baseline), not absolute fractions of HBM peak.
+
+---
+
+# `gate_w1w2.py` -- #147 stop-gate (dry-run by default)
+
+Consumes a sweep CSV and emits a per-shape summary, a per-variant
+verdict table, and a violation list. The gate model is **relative
+to a designated baseline variant**, not absolute fractions of HBM
+peak -- the v0 baseline lives at <0.1% of peak, so absolute
+thresholds are not meaningful at this stage (per claude-opus's
+brief in chat after the first Arc B60 smoke).
+
+Gate semantics:
+
+- **W1 (correctness)** : per variant, `correct == YES` AND
+  `over_threshold == 0`. Hard gate: a `NO` always raises an error.
+- **W2 (speedup)**     : per variant, `bandwidth_gbs / baseline_bw
+  >= --min-speedup` (default 1.5x). Warn by default, upgraded to
+  error in `--strict-gates`. The designated baseline is
+  `16x16_sg16_BRANCHFUL` (matches design v0 narrative); if missing
+  from a shape, falls back to the slowest runnable variant in that
+  shape and emits a `baseline_missing` warning.
+- **Outlier**          : per variant, `bw < --outlier-frac (=0.7)
+  x shape_mean`. Always a warning -- catches bad tile/sg combos.
+- **Soft peak**        : per shape, best `bw / peak <
+  --soft-peak-pct (=0.5%)`. Pure diagnostic, never an error.
+
+```bash
+make gate                              # default: smoke baseline CSV
+make gate GATE_CSV=path/to/run.csv     # arbitrary CSV
+make gate-strict                       # exit 1 on error-severity hits
+python3 gate_w1w2.py --csv-out v.csv sweep_w1_smoke_baseline.csv
+python3 gate_w1w2.py --help            # full flag list
+```
+
+`--csv-out` writes a stable per-variant verdict CSV (columns:
+`variant,M,N,K,bandwidth_gbs,speedup_vs_baseline,is_baseline,
+gate_correctness_ok,gate_speedup_ok,is_outlier,pct_peak,verdict,
+reason`) suitable for downstream calibration notebooks (review
+#62) and cross-run regression diffs.
+
+Lenient parser: `device:` headers and `skip <variant>: <reason>`
+diagnostic lines from `sweep_tile.cpp` (when stderr is merged via
+`2>&1`) are recognized and reported separately, not flagged as
+errors. Header row is keyed by column name; reordered columns and
+extra columns are tolerated as long as the required set
+(`variant, M, N, K, bandwidth_gbs, correct`) is present.
+
+## Severity model
+
+| Finding                                       | Default | --strict-gates |
+|-----------------------------------------------|---------|----------------|
+| `correct == NO`                               | error   | exit 1         |
+| `over_threshold > 0` on a correct row         | warning | unchanged      |
+| `over_threshold > 0` on an incorrect row      | error   | exit 1         |
+| `bw < 0.7 x shape_mean` (outlier)             | warning | unchanged      |
+| `speedup < --min-speedup` (W2)                | warning | upgraded error |
+| Best variant `< --soft-peak-pct` of peak      | warning | unchanged      |
+| Canonical baseline missing in a shape         | warning | unchanged      |
+| Parse errors                                  | logged  | not gated      |
+
+The smoke baseline (`sweep_w1_smoke_baseline.csv`) currently passes
+W1 4/4 and exposes one W2 pass (BRANCHLESS at 1.68x baseline) plus
+two W2 regressions (16x32 and sg=32, both <=1.0x). That distribution
+is what review #62 will use to calibrate the final `--min-speedup`
+value.
