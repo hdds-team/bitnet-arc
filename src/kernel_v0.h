@@ -7,8 +7,7 @@
  *   - Scope:    standalone, synthetic weights, no llama.cpp plumbing
  *
  * v0 MVP target: compile + correct against the 3-way oracle harness.
- * Performance tuning (SLM tiling, register tiling, subgroup math) is
- * deferred to #148 (tile sweep) and #147 (stop-gates instrumentation).
+ * Tile sweep instrumentation lives in #148 via the variant table below.
  *
  * Data layout (v0):
  *   A_fp16  : row-major (M, K), uint16_t bit-pattern of IEEE-754 binary16
@@ -40,7 +39,7 @@ namespace bitnet_arc {
  *   BRANCHFUL: explicit if/else over codes {0,1,2} -> sub/skip/add.
  *              Matches the design v0 narrative (native ternary semantics).
  *   BRANCHLESS: (code - 1) cast to float, fused-friendly. Tile sweep
- *               #148 will compare both paths.
+ *               #148 compares both paths.
  */
 enum class kernel_v0_inner_mode {
     BRANCHFUL  = 0,
@@ -48,7 +47,7 @@ enum class kernel_v0_inner_mode {
 };
 
 struct kernel_v0_config {
-    /* Work-group tile dimensions. Default 16x16 per design v0 §4.
+    /* Work-group tile dimensions. Default 16x16 per design v0 #4.
      *
      * Unsigned to make negative values impossible at the type level:
      * the kernel does `M % tile_M` after casting to size_t, which
@@ -58,33 +57,33 @@ struct kernel_v0_config {
      * type instead (per @codex review #60). */
     unsigned tile_M;
     unsigned tile_N;
+    /* Subgroup size. SYCL requires this be compile-time, so the
+     * runtime field here is only used by run_kernel_v0() to *dispatch*
+     * to one of the explicit variants below. Unsupported combinations
+     * fall back to the 16x16/sg16/branchful baseline. */
+    unsigned sg_size;
     /* See kernel_v0_inner_mode above. */
     kernel_v0_inner_mode inner_mode;
 };
 
-/*
- * Note on subgroup size:
- *   v0 deliberately does NOT expose a runtime subgroup_size knob.
- *   SYCL controls the subgroup size via the [[reqd_sub_group_size(N)]]
- *   kernel attribute, which must be a compile-time constant -- a
- *   runtime field would be silently ignored, making the API contract
- *   misleading (per @codex review #60).
- *
- *   v0 locks the subgroup size to 16 by emitting the attribute
- *   directly on the kernel lambda in kernel_v0.cpp. Tile sweep #148
- *   will introduce compile-time templated kernel variants for
- *   subgroup sizes 8 / 16 / 32 rather than a runtime config field.
- */
-
-/* Sensible defaults for the v0 baseline (16x16 tile, branchful inner
- * loop matching the design v0 "ternary add/sub/skip" narrative). */
+/* Sensible defaults for the v0 baseline (16x16 tile, sg=16, branchful
+ * matching the design v0 "ternary add/sub/skip" narrative). */
 inline kernel_v0_config kernel_v0_config_default() {
     return kernel_v0_config{
         /* tile_M     */ 16u,
         /* tile_N     */ 16u,
+        /* sg_size    */ 16u,
         /* inner_mode */ kernel_v0_inner_mode::BRANCHFUL,
     };
 }
+
+/* Opaque handle wrapping sycl::queue, declared here so the public
+ * header does not pull <sycl/sycl.hpp> into every translation unit
+ * that just wants to call the kernel. Implementation in kernel_v0.cpp. */
+class sycl_queue_handle;
+
+sycl_queue_handle* make_default_queue_handle();
+void               destroy_queue_handle(sycl_queue_handle* h);
 
 /*
  * Run the v0 ternary matmul on a SYCL queue.
@@ -99,8 +98,12 @@ inline kernel_v0_config kernel_v0_config_default() {
  *
  * Returns after the kernel is submitted (does NOT wait). Caller is
  * responsible for queue.wait() before reading C_fp16.
+ *
+ * cfg selects one of the precompiled variants exposed in kv0_variants[]
+ * below; if cfg does not match a registered variant, falls back to the
+ * baseline (16x16 / sg16 / branchful).
  */
-void run_kernel_v0(class sycl_queue_handle& q_handle,
+void run_kernel_v0(sycl_queue_handle& q_handle,
                    std::size_t M,
                    std::size_t N,
                    std::size_t K,
@@ -109,19 +112,32 @@ void run_kernel_v0(class sycl_queue_handle& q_handle,
                    std::uint16_t* C_fp16,
                    const kernel_v0_config& cfg = kernel_v0_config_default());
 
-/*
- * Opaque handle wrapping sycl::queue, declared here so the public
- * header does not pull <sycl/sycl.hpp> into every translation unit
- * that just wants to call the kernel.
- *
- * Implementation in kernel_v0.cpp.
- */
-class sycl_queue_handle;
+/* --- variant table for #148 tile sweep ------------------------------ */
 
-/* Construct a default queue handle (default selector + in-order queue).
- * Caller owns the returned pointer and must delete it. */
-sycl_queue_handle* make_default_queue_handle();
-void              destroy_queue_handle(sycl_queue_handle* h);
+/* Type-erased launcher. The compile-time template parameters
+ * (TILE_M, TILE_N, SG_SIZE, MODE) are baked into the function pointed
+ * to here; the bench harness picks one of these by index without
+ * needing to know the SYCL types. */
+typedef void (*kv0_launch_fn)(sycl_queue_handle& q_handle,
+                              std::size_t M,
+                              std::size_t N,
+                              std::size_t K,
+                              const std::uint16_t* A_fp16,
+                              const bitnet_arc_tq2_0_block* B_blocks,
+                              std::uint16_t* C_fp16);
+
+struct kernel_variant_desc {
+    unsigned             tile_M;
+    unsigned             tile_N;
+    unsigned             sg_size;
+    kernel_v0_inner_mode inner_mode;
+    const char*          name;
+    kv0_launch_fn        launch;
+};
+
+/* Registered variants (smoke set, expanded in follow-up sweeps). */
+extern const kernel_variant_desc kv0_variants[];
+extern const std::size_t         kv0_variants_count;
 
 } /* namespace bitnet_arc */
 

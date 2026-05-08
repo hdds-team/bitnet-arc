@@ -2,12 +2,16 @@
  * bitnet-arc v0 SYCL kernel implementation.
  *
  * See kernel_v0.h for the public contract and design anchors. The
- * inner-loop semantics here follow design v0 §2.2 "GPU path: ALU
+ * inner-loop semantics here follow design v0 #2.2 "GPU path: ALU
  * vectorial" -- ternary {-1, 0, +1} maps to native sub / skip / add
  * with no multiplies in the hot path.
  *
- * Build: this TU requires DPC++ / icpx / clang++ with SYCL2020. See
- * src/Makefile for the toolchain invocation.
+ * #148 sweep: kernel body is a function template parameterized on
+ * (TILE_M, TILE_N, SG_SIZE, MODE). Six explicit instantiations are
+ * registered in kv0_variants[] below; the bench harness iterates
+ * that table without knowing the SYCL types.
+ *
+ * Build: requires DPC++ / icpx with SYCL2020. See src/Makefile.
  */
 
 #include "kernel_v0.h"
@@ -41,7 +45,7 @@ void destroy_queue_handle(sycl_queue_handle* h) {
     delete h;
 }
 
-/* -- TQ2_0 unpack helpers (device-callable) --------------------------- */
+/* -- TQ2_0 unpack helper (device-callable) ---------------------------- */
 
 /* Decode a 2-bit code at block-relative position i in [0, 256). Mirrors
  * oracle/tq2_0.c byte/shift formula bit-for-bit. */
@@ -107,72 +111,59 @@ static inline uint16_t kv0_fp32_to_fp16(float f) {
                     | (mant >> 13));
 }
 
-/* -- public API ------------------------------------------------------- */
+/* -- templated kernel ------------------------------------------------- */
 
-void run_kernel_v0(sycl_queue_handle& q_handle,
-                   std::size_t M,
-                   std::size_t N,
-                   std::size_t K,
-                   const std::uint16_t* A_fp16,
-                   const bitnet_arc_tq2_0_block* B_blocks,
-                   std::uint16_t* C_fp16,
-                   const kernel_v0_config& cfg)
+/* All four template parameters bake in compile-time. SG_SIZE feeds
+ * [[sycl::reqd_sub_group_size(SG_SIZE)]] on the lambda; MODE drives
+ * the inner-loop selection via constexpr if; TILE_M/TILE_N control
+ * the work-group local range. */
+template <unsigned TILE_M,
+          unsigned TILE_N,
+          unsigned SG_SIZE,
+          kernel_v0_inner_mode MODE>
+static void kv0_launch_impl(sycl_queue_handle& q_handle,
+                            std::size_t M,
+                            std::size_t N,
+                            std::size_t K,
+                            const std::uint16_t* A_fp16,
+                            const bitnet_arc_tq2_0_block* B_blocks,
+                            std::uint16_t* C_fp16)
 {
+    static_assert(TILE_M > 0u && TILE_N > 0u, "tile dims must be > 0");
+    static_assert(SG_SIZE == 8u || SG_SIZE == 16u || SG_SIZE == 32u,
+                  "SG_SIZE must be one of {8, 16, 32}");
+
     /* Host-side preconditions. v0 keeps these strict; padding is a
-     * v0.5+ concern when we wire real BitNet 8B GGUF inputs.
-     *
-     * tile_M / tile_N are unsigned in the API (see kernel_v0.h note
-     * on @codex review #60), so negative values are impossible. We
-     * still need to forbid zero before the modulo. */
-    assert(M > 0 && "kernel_v0: M must be > 0");
-    assert(N > 0 && "kernel_v0: N must be > 0");
-    assert(K > 0 && "kernel_v0: K must be > 0");
+     * v0.5+ concern when we wire real BitNet 8B GGUF inputs. */
+    assert(M > 0 && "kv0: M must be > 0");
+    assert(N > 0 && "kv0: N must be > 0");
+    assert(K > 0 && "kv0: K must be > 0");
     assert(K % 256 == 0
-           && "kernel_v0: K must be a multiple of TQ2_0 block size (256)");
-    assert(cfg.tile_M > 0u && cfg.tile_N > 0u
-           && "kernel_v0: tile dims must be > 0");
-    assert(M % static_cast<std::size_t>(cfg.tile_M) == 0
-           && "kernel_v0: M must be a multiple of tile_M");
-    assert(N % static_cast<std::size_t>(cfg.tile_N) == 0
-           && "kernel_v0: N must be a multiple of tile_N");
+           && "kv0: K must be a multiple of TQ2_0 block size (256)");
+    assert(M % static_cast<std::size_t>(TILE_M) == 0
+           && "kv0: M must be a multiple of TILE_M");
+    assert(N % static_cast<std::size_t>(TILE_N) == 0
+           && "kv0: N must be a multiple of TILE_N");
 
     const std::size_t blocks_per_col = K / 256;
-    const std::size_t tile_M = static_cast<std::size_t>(cfg.tile_M);
-    const std::size_t tile_N = static_cast<std::size_t>(cfg.tile_N);
-    const auto inner_mode   = cfg.inner_mode;
 
     sycl::queue& q = q_handle.q;
 
     q.submit([&](sycl::handler& h) {
-        /* nd_range:
-         *   global = (M, N)            (one work-item per output element)
-         *   local  = (tile_M, tile_N)  (work-group, default 16x16)
-         */
         const sycl::range<2> global_range(M, N);
-        const sycl::range<2> local_range(tile_M, tile_N);
+        const sycl::range<2> local_range(TILE_M, TILE_N);
 
-        /* v0 baseline: subgroup size locked to 16 via the
-         * compile-time attribute on the kernel lambda. Without this
-         * attribute the runtime is free to pick any subgroup size,
-         * which would make #148 tile sweep measurements meaningless
-         * (varying tile_M/tile_N would not actually exercise the
-         * subgroup dimension). #148 will introduce templated kernel
-         * variants for sizes 8 / 16 / 32, each with its own
-         * reqd_sub_group_size attribute (per @claude-opus + @sonnet
-         * +@codex review #60 follow-up). */
         h.parallel_for(
             sycl::nd_range<2>(global_range, local_range),
-            [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
+            [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
                 const std::size_t m = it.get_global_id(0);
                 const std::size_t n = it.get_global_id(1);
 
                 /* Per-item accumulator in FP32. The output rounds to
                  * FP16 once at the end. Tile-local SLM accumulation is
-                 * a #148 sweep concern; v0 keeps it simple. */
+                 * a #148 follow-up; v0 baseline keeps it simple. */
                 float acc = 0.0f;
 
-                /* Walk K in TQ2_0 block chunks. Block (n, k_chunk) is
-                 * laid out at index n * blocks_per_col + k_chunk. */
                 for (std::size_t k_chunk = 0; k_chunk < blocks_per_col;
                      ++k_chunk)
                 {
@@ -183,14 +174,12 @@ void run_kernel_v0(sycl_queue_handle& q_handle,
                     float partial = 0.0f;
                     const std::size_t k_base = k_chunk * 256;
 
-                    /* Inner block loop: 256 ternary weights against
-                     * 256 contiguous activations. */
                     for (std::size_t i = 0; i < 256; ++i) {
                         const std::uint16_t a_bits = A_fp16[m * K + k_base + i];
                         const float a = kv0_fp16_to_fp32(a_bits);
                         const std::uint8_t code = kv0_unpack_code(blk, i);
 
-                        if (inner_mode == kernel_v0_inner_mode::BRANCHFUL) {
+                        if constexpr (MODE == kernel_v0_inner_mode::BRANCHFUL) {
                             /* Native ternary semantics:
                              *   code 0 (-1) -> partial -= a
                              *   code 1 ( 0) -> skip
@@ -209,15 +198,95 @@ void run_kernel_v0(sycl_queue_handle& q_handle,
                         }
                     }
 
-                    /* Apply per-block scale once, after the 256
-                     * unscaled ternary contractions. */
                     acc = acc + scale * partial;
                 }
 
-                /* Round to FP16 on output. */
                 C_fp16[m * N + n] = kv0_fp32_to_fp16(acc);
             });
     });
+}
+
+/* -- variant registration -------------------------------------------- *
+ *
+ * X-macro listing the (TM, TN, SG, MODE) tuples that get explicit
+ * launchers + table entries. Each row generates:
+ *   - a non-templated wrapper kv0_launch_<TM>_<TN>_<SG>_<MODE>()
+ *   - a row in kv0_variants[] pointing to that wrapper
+ *
+ * Smoke set for #148 (6 variants, ~5 min run on Arc B60):
+ *   tile sweep   : (16x16) (32x16) (16x32) (32x32) at sg=16, branchful
+ *   inner mode   : (16x16) sg=16, branchless
+ *   subgroup     : (16x16) sg=32, branchful
+ *
+ * To extend the sweep, add rows here and rebuild. Compile time scales
+ * roughly linearly with row count.
+ */
+
+#define BITNET_ARC_KV0_VARIANTS(X)            \
+    X(16, 16, 16, BRANCHFUL)                  \
+    X(32, 16, 16, BRANCHFUL)                  \
+    X(16, 32, 16, BRANCHFUL)                  \
+    X(32, 32, 16, BRANCHFUL)                  \
+    X(16, 16, 16, BRANCHLESS)                 \
+    X(16, 16, 32, BRANCHFUL)
+
+#define KV0_DEFINE_LAUNCHER(TM, TN, SG, MODE)                            \
+    static void kv0_launch_##TM##_##TN##_##SG##_##MODE(                  \
+        sycl_queue_handle& q,                                            \
+        std::size_t M, std::size_t N, std::size_t K,                     \
+        const std::uint16_t* A,                                          \
+        const bitnet_arc_tq2_0_block* B,                                 \
+        std::uint16_t* C)                                                \
+    {                                                                    \
+        kv0_launch_impl<TM, TN, SG, kernel_v0_inner_mode::MODE>(         \
+            q, M, N, K, A, B, C);                                        \
+    }
+
+BITNET_ARC_KV0_VARIANTS(KV0_DEFINE_LAUNCHER)
+
+#undef KV0_DEFINE_LAUNCHER
+
+#define KV0_TABLE_ROW(TM, TN, SG, MODE)                                  \
+    { TM, TN, SG, kernel_v0_inner_mode::MODE,                            \
+      #TM "x" #TN "_sg" #SG "_" #MODE,                                   \
+      &kv0_launch_##TM##_##TN##_##SG##_##MODE },
+
+extern const kernel_variant_desc kv0_variants[] = {
+    BITNET_ARC_KV0_VARIANTS(KV0_TABLE_ROW)
+};
+
+extern const std::size_t kv0_variants_count =
+    sizeof(kv0_variants) / sizeof(kv0_variants[0]);
+
+#undef KV0_TABLE_ROW
+#undef BITNET_ARC_KV0_VARIANTS
+
+/* -- runtime dispatcher (compat API) ---------------------------------- */
+
+void run_kernel_v0(sycl_queue_handle& q_handle,
+                   std::size_t M,
+                   std::size_t N,
+                   std::size_t K,
+                   const std::uint16_t* A_fp16,
+                   const bitnet_arc_tq2_0_block* B_blocks,
+                   std::uint16_t* C_fp16,
+                   const kernel_v0_config& cfg)
+{
+    /* Look up cfg in the variant table. If no match, fall back to the
+     * baseline (always at index 0 by construction). */
+    for (std::size_t i = 0; i < kv0_variants_count; ++i) {
+        const kernel_variant_desc& v = kv0_variants[i];
+        if (v.tile_M     == cfg.tile_M
+         && v.tile_N     == cfg.tile_N
+         && v.sg_size    == cfg.sg_size
+         && v.inner_mode == cfg.inner_mode)
+        {
+            v.launch(q_handle, M, N, K, A_fp16, B_blocks, C_fp16);
+            return;
+        }
+    }
+    /* Fallback: baseline (16x16 / sg16 / branchful) is row 0. */
+    kv0_variants[0].launch(q_handle, M, N, K, A_fp16, B_blocks, C_fp16);
 }
 
 } /* namespace bitnet_arc */
