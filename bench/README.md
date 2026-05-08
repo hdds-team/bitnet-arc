@@ -56,12 +56,61 @@ make run           # runs the 3 cases with seed 1337
 
 Exit 0 = all cases pass, exit 1 = at least one gate failed.
 
-## Status
+## Status (3-way harness)
 
 - [x] Voice 1 (FP32 maison) wiring
 - [x] Voice 2 (TQ2_0 quantize/dequantize round-trip) wiring
 - [x] Voice 3 (numpy float64 BLAS subprocess) wiring
 - [x] Tolerance gates from `oracle/tolerance.h`
 - [x] Three QA cases (zero_tile, k256, k14336)
-- [ ] First run on hardware (requires `python3 + numpy` available)
-- [ ] SYCL kernel v0 plugged in (#146 v2 / W1 close)
+- [x] First run on hardware: ALL PASS (margins ~3 orders below tol)
+
+---
+
+# `sweep_tile.cpp` -- #148 SYCL tile sweep
+
+Iterates the variants registered in `src/kernel_v0.cpp::kv0_variants[]`
+on a single shape (default `M=16 N=64 K=14336`, LLaMA-8B FFN), runs
+warmup + timed launches, checks correctness vs an FP32 reference, and
+emits a CSV row per variant on stdout.
+
+```bash
+make CXX_SYCL=icpx sweep_tile     # build (requires icpx + Arc device)
+./sweep_tile                       # smoke shape, default seed
+./sweep_tile --M 16 --N 64 --K 14336 --warmup 3 --timed 10
+```
+
+Tolerance: SYCL output rounds to FP16 once at the end, so the gate is
+`BITNET_ARC_TOL_SYCL_VS_FP32REF` (1e-2). The tighter FP32-vs-FP32
+gate from the 3-way harness does not apply here.
+
+## Smoke baseline (Arc Pro B60, 2026-05-08)
+
+First sweep on the registered 6 variants at `M=16 N=64 K=14336`:
+
+| Variant                 | time_ms_med | bw_gbs | correct | max_rel_err |
+|-------------------------|-------------|--------|---------|-------------|
+| `16x16_sg16_BRANCHFUL`  | 3.71        | 0.19   | YES     | 9.47e-4     |
+| `16x32_sg16_BRANCHFUL`  | 3.73        | 0.19   | YES     | 9.47e-4     |
+| `16x16_sg16_BRANCHLESS` | **2.17**    | **0.32** | YES   | 9.47e-4     |
+| `16x16_sg32_BRANCHFUL`  | 4.24        | 0.16   | YES     | 9.47e-4     |
+
+(`32x16` and `32x32` skipped: `tile_M=32` incompatible with `M=16`.)
+
+Observations:
+
+- **Correctness 4/4** at this shape -- templated dispatch works, kernel
+  output is FP16-stable vs the FP32 reference (10x under tolerance).
+- **BRANCHLESS wins ~1.7x** over BRANCHFUL on identical config. GPU
+  warps prefer SIMD-aligned multiplies-by-zero over divergent control
+  flow, even when 45% of the multiplies are by zero.
+- **`sg=32` is slower** than `sg=16` for a 16x16 tile (14% slower).
+  A subgroup of 32 has idle items when the work-group is only 256 wide;
+  this suggests the tile sweep should pair `sg` with the matching tile
+  dim once we land 32x32 / 64x64 variants.
+- **Bandwidth 0.16-0.32 GB/s** vs Arc B60 HBM peak 456 GB/s -- we are
+  at 0.04-0.07% of peak. Expected for the v0 baseline (one work-item
+  per output, no SLM, no coalesced loads); the value of #148 is
+  precisely to make this gap visible. Stop-gates calibration (#147)
+  must therefore use *relative* targets (each variant >=1.5x faster
+  than baseline), not absolute fractions of HBM peak.

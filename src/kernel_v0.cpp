@@ -14,28 +14,14 @@
  * Build: requires DPC++ / icpx with SYCL2020. See src/Makefile.
  */
 
-#include "kernel_v0.h"
+#include "kernel_v0_sycl.hpp"
 
 #include <cassert>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 
-#include <sycl/sycl.hpp>
-
 namespace bitnet_arc {
-
-/* -- queue handle wrapper --------------------------------------------- */
-
-class sycl_queue_handle {
-public:
-    sycl::queue q;
-
-    sycl_queue_handle()
-        : q(sycl::default_selector_v, sycl::property::queue::in_order{}) {}
-
-    explicit sycl_queue_handle(const sycl::queue& src) : q(src) {}
-};
 
 sycl_queue_handle* make_default_queue_handle() {
     return new sycl_queue_handle();
