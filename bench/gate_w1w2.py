@@ -37,10 +37,11 @@ baseline being ~0.07% of HBM peak):
     Soft peak (info)   : best variant < --soft-peak-pct (=0.5%) of
                          HBM peak. Diagnostic only, never fails.
 
-The baseline variant defaults to '16x16_sg16_BRANCHFUL' (matches
-design v0 narrative); falls back to slowest runnable variant in the
-shape if absent and emits a 'baseline_missing' warning. Override
-via --baseline-variant.
+The baseline variant defaults to '16x16_sg16_BRANCHLESS' (empirical
+best-v0 across the W1.5 multi-shape sweep, switched from BRANCHFUL
+in review #65); falls back to slowest runnable variant in the shape
+if absent and emits a 'baseline_missing' warning. Override via
+--baseline-variant.
 
 Usage:
     python3 gate_w1w2.py path/to/sweep.csv
@@ -77,13 +78,32 @@ DEFAULT_MIN_SPEEDUP = 1.5
 # baseline lives well below 1% of peak by design.
 DEFAULT_SOFT_PEAK_PCT = 0.5
 
-# Designated baseline variant. Picked to match design v0 narrative:
-# smallest registered tile (16x16), default sg (16), branchful inner
-# loop (matches the design v0 narrative of "native ternary semantics
-# with sub/skip/add"). If this variant is missing from a given shape
-# (e.g. tile_M=16 incompatible with M=8), gate_w1w2 falls back to the
-# slowest runnable variant in that shape and emits a warning.
-DEFAULT_BASELINE_VARIANT = "16x16_sg16_BRANCHFUL"
+# Designated baseline variant. Switched in review #65 from BRANCHFUL
+# to BRANCHLESS based on the W1.5 multi-shape sweep on Arc Pro B60
+# (commit 3794a09): BRANCHLESS won universally at 1.66x-1.83x over
+# BRANCHFUL across (16,16,256), (16,64,4096), (16,64,14336), and
+# (64,64,14336). Keeping the BRANCHFUL strawman as baseline made the
+# W2 gate trivial (every BRANCHLESS variant passed automatically);
+# tracking the empirical best-v0 instead turns W2 into a real bar
+# for kernel v1 SLM tiling ("must beat best-v0 by min_speedup").
+#
+# The design v0 narrative ("native ternary semantics, sub/skip/add")
+# is preserved in src/kernel_v0.cpp -- it's the spec, not the GPU
+# performance leader. BRANCHFUL stays in kv0_variants[] as a
+# regression marker (its rows show as `regress` in every gate run,
+# which is accurate -- it is slower than the empirical baseline).
+#
+# Pending follow-ups (post-switch, tracked separately):
+#   - Extreme-shape coverage (M=1 decode, M=512) -- @theta
+#   - Variance analysis from raw timings (--timed elevation) -- @sonnet
+#   - sg=32 shape-dependence root cause (suspected K-dim memory
+#     access pattern interaction)
+#
+# If this variant is missing from a given shape (e.g. tile_M=16
+# incompatible with M=8), gate_w1w2 falls back to the slowest
+# runnable variant in that shape and emits a `baseline_missing`
+# warning.
+DEFAULT_BASELINE_VARIANT = "16x16_sg16_BRANCHLESS"
 
 # Outlier rule: a variant is an outlier within its shape group if its
 # bandwidth is below this fraction of the shape's mean bandwidth.

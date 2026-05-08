@@ -133,10 +133,13 @@ llm`. Saved to `sweep_w15_llm_baseline.csv`. Best per shape:
 Findings:
 
 1. **BRANCHLESS wins universally** on all 4 shapes. The 1.7x smoke
-   result is structural, not a fluke. BRANCHLESS becomes the
-   designated v1 baseline candidate (gate_w1w2.py default still
-   tracks `16x16_sg16_BRANCHFUL` per the design v0 narrative; that
-   choice is up for review #65).
+   result is structural, not a fluke. BRANCHLESS adopted as the
+   v0.5+ empirical baseline in review #65 (gate_w1w2.py default
+   `DEFAULT_BASELINE_VARIANT` switched from `16x16_sg16_BRANCHFUL`
+   to `16x16_sg16_BRANCHLESS`). BRANCHFUL preserved in
+   `kv0_variants[]` as a regression marker for the design v0
+   narrative; it shows as `regress` in every gate run, which is
+   accurate -- the data says BRANCHLESS is the GPU-optimal v0.
 2. **Tile size is irrelevant for BRANCHLESS at small M.** `16x16_BL`
    ties or beats `32x32_BL` at every shape that runs both. The win
    is the inner-loop mode, not the work distribution.
@@ -158,7 +161,10 @@ Findings:
 # Reproduce:
 ./sweep_tile --shapes-preset llm > sweep_w15_llm_baseline.csv 2>&1
 python3 gate_w1w2.py sweep_w15_llm_baseline.csv
-# Result: 0 errors, 15 warnings (all expected: soft_peak + W2 regressions on BRANCHFUL).
+# Result with new BRANCHLESS baseline (review #65): 0 errors, ~20
+# warnings -- soft_peak on every shape (kernel still <0.5% of peak,
+# expected), plus all BRANCHFUL variants showing as `regress` (also
+# expected -- BL is the empirical baseline, BF is genuinely slower).
 
 # Add custom shapes:
 ./sweep_tile --shape 32,32,4096 --shape 64,128,14336
@@ -182,9 +188,10 @@ Gate semantics:
 - **W2 (speedup)**     : per variant, `bandwidth_gbs / baseline_bw
   >= --min-speedup` (default 1.5x). Warn by default, upgraded to
   error in `--strict-gates`. The designated baseline is
-  `16x16_sg16_BRANCHFUL` (matches design v0 narrative); if missing
-  from a shape, falls back to the slowest runnable variant in that
-  shape and emits a `baseline_missing` warning.
+  `16x16_sg16_BRANCHLESS` (empirical best-v0 across the W1.5
+  multi-shape sweep, switched from BRANCHFUL in review #65); if
+  missing from a shape, falls back to the slowest runnable variant
+  in that shape and emits a `baseline_missing` warning.
 - **Outlier**          : per variant, `bw < --outlier-frac (=0.7)
   x shape_mean`. Always a warning -- catches bad tile/sg combos.
 - **Soft peak**        : per shape, best `bw / peak <
