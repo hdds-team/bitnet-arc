@@ -119,7 +119,7 @@ struct kv1_variant_desc {
     kv1_launch_fn  launch;
 };
 
-/* Registered variants. Phase 1 + 2a (15 entries):
+/* Registered variants. Phase 1 + 2a (12 entries):
  *
  *   K_CHUNK=256 (phase 1, commit b3179af):
  *     v1_16x16_sg16_k256
@@ -131,14 +131,22 @@ struct kv1_variant_desc {
  *   K_CHUNK=512 (phase 2a, task #153):
  *     v1_<TM>x<TN>_sg<SG>_k512   (5 entries, same tile/sg combos)
  *
- *   K_CHUNK=1024 (phase 2a, task #153):
- *     v1_<TM>x<TN>_sg<SG>_k1024  (5 entries, same tile/sg combos)
+ *   K_CHUNK=1024 (phase 2a, task #153, SLM-constrained):
+ *     v1_16x16_sg16_k1024
+ *     v1_16x32_sg16_k1024
  *
  * Phase 2a tests hypothesis H2 (barrier overhead): K_CHUNK=1024 has
  * 4x fewer barrier-pairs than K_CHUNK=256 at K=14336. If the gain is
  * insignificant, H2 is not the dominant factor and the bottleneck
  * lies in the cooperative-load access pattern (tested separately by
  * phase 2b / task #154 -- two-pass coalesced load).
+ *
+ * SLM budget note (per @theta review #68): TILE_M=32 with K_CHUNK=1024
+ * makes A_slab alone fill the ~64 KB Xe2 per-WG SLM hard limit, which
+ * would tank occupancy to 1 WG/Xe-core. Those 3 variants are therefore
+ * not registered at K_CHUNK=1024 (32x16, 32x32_sg16, 32x32_sg32).
+ * Revisitable at v1.5 if Xe3+ exposes >=128 KB SLM/WG or via FP8 A_slab
+ * staging (design v2 territory).
  *
  * Variants with K not a multiple of K_CHUNK are skipped at sweep
  * runtime (e.g. K_CHUNK=512 and 1024 skip on shape (16,16,256)). */

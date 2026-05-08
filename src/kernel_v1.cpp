@@ -303,16 +303,24 @@ static void kv1_launch_impl(sycl_queue_handle& q_handle,
     X(16, 32, 16, 512)                    \
     X(32, 32, 16, 512)                    \
     X(32, 32, 32, 512)                    \
-    /* Phase 2a (task #153): K_CHUNK=1024                             */ \
-    /* tests H2 fully -- 14 barrier-pairs at K=14336 (4x fewer than  */ \
+    /* Phase 2a (task #153): K_CHUNK=1024                              */ \
+    /* tests H2 fully -- 14 barrier-pairs at K=14336 (4x fewer than   */ \
     /* the K_CHUNK=256 baseline). Variants are skipped at run time on */ \
     /* shapes where K % 1024 != 0 (e.g. (16,16,256)) via sweep_tile's */ \
     /* K%K_CHUNK guard.                                                */ \
+    /*                                                                 */ \
+    /* SLM budget at K_CHUNK=1024 (per @theta review #68 catch):       */ \
+    /*   A_slab = TILE_M * 1024 * 2 bytes (FP16)                       */ \
+    /*   B_slab = (1024/256) * TILE_N * 66 bytes                       */ \
+    /*   Arc B60 / Xe2 hard limit per WG: ~64 KB.                      */ \
+    /*                                                                 */ \
+    /* TILE_M=32 means A_slab alone = 64 KB -- leaves zero room for    */ \
+    /* B_slab and tanks occupancy to 1 WG/Xe-core. The TILE_M=32 rows  */ \
+    /* at K_CHUNK=1024 are therefore dropped from this phase. They     */ \
+    /* would be revisitable at v1.5 if SLM/WG exceeds 64 KB on Xe3+    */ \
+    /* or via reduced-precision A_slab (FP8 staging, design v2).       */ \
     X(16, 16, 16, 1024)                   \
-    X(32, 16, 16, 1024)                   \
-    X(16, 32, 16, 1024)                   \
-    X(32, 32, 16, 1024)                   \
-    X(32, 32, 32, 1024)
+    X(16, 32, 16, 1024)
 
 #define KV1_DEFINE_LAUNCHER(TM, TN, SG, KC)                              \
     static void kv1_launch_##TM##_##TN##_##SG##_##KC(                    \
