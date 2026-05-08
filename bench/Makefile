@@ -29,7 +29,7 @@ HEADERS    := ../oracle/fp16.h \
               ../oracle/tq2_0.h \
               ../oracle/fp32_matmul.h \
               ../oracle/tolerance.h
-KERNEL_HDR := ../src/kernel_v0.h
+KERNEL_HDR := ../src/kernel_v0.h ../src/kernel_v1.h
 
 harness_3way: harness_3way.cpp $(ORACLE_LIB) $(HEADERS)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) harness_3way.cpp $(ORACLE_LIB) -o $@

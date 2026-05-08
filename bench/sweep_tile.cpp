@@ -25,6 +25,7 @@
  */
 
 #include "../src/kernel_v0_sycl.hpp"
+#include "../src/kernel_v1.h"
 #include "../oracle/fp16.h"
 #include "../oracle/tq2_0.h"
 #include "../oracle/fp32_matmul.h"
@@ -49,6 +50,9 @@ using bitnet_arc::kernel_variant_desc;
 using bitnet_arc::kernel_v0_inner_mode;
 using bitnet_arc::kv0_variants;
 using bitnet_arc::kv0_variants_count;
+using bitnet_arc::kv1_variant_desc;
+using bitnet_arc::kv1_variants;
+using bitnet_arc::kv1_variants_count;
 using bitnet_arc::sycl_queue_handle;
 
 /* --- input generation ------------------------------------------------ */
@@ -177,9 +181,15 @@ struct run_stats {
     const char* skip_reason;    /* set when ran == false */
 };
 
+/* Templated on the descriptor type so kv0_variant_desc and
+ * kv1_variant_desc can both be iterated by the same code. Both expose
+ * tile_M/tile_N/name/launch with matching semantics; the only field
+ * that differs is the v0-only `inner_mode` vs v1-only `k_chunk`,
+ * which is reflected in the variant name and not used here. */
+template <typename DescT>
 run_stats run_variant(sycl::queue&                          q,
                       sycl_queue_handle&                    q_handle,
-                      const kernel_variant_desc&            v,
+                      const DescT&                          v,
                       std::size_t                           M,
                       std::size_t                           N,
                       std::size_t                           K,
@@ -316,6 +326,7 @@ int run_shape(const shape_t& sh,
 
     std::vector<uint16_t> C_host(M * N, 0);
 
+    /* --- v0 pass --- */
     for (std::size_t i = 0; i < kv0_variants_count; ++i) {
         const kernel_variant_desc& v = kv0_variants[i];
 
@@ -345,6 +356,59 @@ int run_shape(const shape_t& sh,
             "%s,%zu,%zu,%zu,%u,%u,%u,%s,%.4f,%.4f,%.0f,%.2f,%s,%.3g,%zu\n",
             v.name, M, N, K,
             v.tile_M, v.tile_N, v.sg_size, mode_name(v.inner_mode),
+            s.time_ms_med, s.time_ms_min,
+            total_bytes, s.bandwidth_gbs,
+            s.correct ? "YES" : "NO",
+            s.max_rel_err, s.over_threshold);
+        std::fflush(stdout);
+    }
+
+    /* --- v1 pass --- *
+     *
+     * Same shape, same input device buffers, same correctness check
+     * (BITNET_ARC_TOL_SYCL_VS_FP32REF). v1 variants are reported with
+     * mode="BRANCHLESS" (v1 is BRANCHLESS-only by design v1 sec 2.4);
+     * the K_CHUNK is encoded in the variant name (suffix "_k<KC>"). */
+    for (std::size_t i = 0; i < kv1_variants_count; ++i) {
+        const kv1_variant_desc& v = kv1_variants[i];
+
+        /* v1 has its own K_CHUNK precondition (K % K_CHUNK == 0). The
+         * per-variant launcher asserts on this; check up front so we
+         * skip cleanly instead of aborting the sweep. */
+        if (K % v.k_chunk != 0) {
+            std::fprintf(stderr,
+                         "skip %s: K not multiple of K_CHUNK "
+                         "(K=%zu, k_chunk=%u)\n",
+                         v.name, K, v.k_chunk);
+            continue;
+        }
+
+        const run_stats s = run_variant(
+            q, q_handle, v, M, N, K,
+            A_dev, B_dev, C_dev,
+            C_ref, C_host,
+            warmup, timed);
+
+        if (!s.ran) {
+            std::fprintf(stderr,
+                         "skip %s: %s (M=%zu, N=%zu, tile=%ux%u)\n",
+                         v.name, s.skip_reason, M, N, v.tile_M, v.tile_N);
+            continue;
+        }
+
+        const double w_bytes = static_cast<double>(N) *
+                               (static_cast<double>(K) / 256.0) *
+                               static_cast<double>(sizeof(bitnet_arc_tq2_0_block));
+        const double a_b = static_cast<double>(M) * static_cast<double>(K) *
+                           sizeof(std::uint16_t);
+        const double o_b = static_cast<double>(M) * static_cast<double>(N) *
+                           sizeof(std::uint16_t);
+        const double total_bytes = w_bytes + a_b + o_b;
+
+        std::printf(
+            "%s,%zu,%zu,%zu,%u,%u,%u,%s,%.4f,%.4f,%.0f,%.2f,%s,%.3g,%zu\n",
+            v.name, M, N, K,
+            v.tile_M, v.tile_N, v.sg_size, "BRANCHLESS",
             s.time_ms_med, s.time_ms_min,
             total_bytes, s.bandwidth_gbs,
             s.correct ? "YES" : "NO",

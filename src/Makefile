@@ -27,9 +27,12 @@ CXXFLAGS:= -O2 -std=c++17 -Wall -Wextra -fsycl
 
 INCLUDES := -I. -I..
 
-OBJS    := kernel_v0.o
-HEADERS := kernel_v0.h ../oracle/tq2_0.h
+OBJS    := kernel_v0.o kernel_v1.o
+HEADERS := kernel_v0.h kernel_v1.h kernel_v0_sycl.hpp ../oracle/tq2_0.h
 
+# Library name kept as v0 for backward compat with bench/Makefile (the
+# archive aggregates both v0 and v1 kernel translation units; v1 is
+# additive, no v0 changes per the design v1 contract).
 libbitnet_arc_v0.a: $(OBJS)
 	$(AR) rcs $@ $^
 
