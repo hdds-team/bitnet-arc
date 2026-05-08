@@ -1,0 +1,23 @@
+# Build artifacts
+*.o
+*.a
+*.so
+*.dylib
+
+# Built binaries
+oracle/upstream_gating/gate
+bench/harness_3way
+bench/sweep_tile
+
+# Test fixtures (regenerated via gen_inputs.py / harness)
+oracle/upstream_gating/inputs/
+
+# Local results
+*.csv
+*.log
+
+# Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
