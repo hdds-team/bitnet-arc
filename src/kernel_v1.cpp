@@ -137,6 +137,30 @@ static void kv1_launch_impl(sycl_queue_handle& q_handle,
     static_assert(K_CHUNK % 256u == 0u,
                   "K_CHUNK must be a multiple of TQ2_0 block size (256)");
 
+    /* SLM budget guard (per @theta + @sonnet review #68 catch). Arc Xe2
+     * exposes ~64 KB of SLM per work-group as a hard limit -- past that
+     * the runtime either refuses to launch or spills, both equally bad.
+     * Any new (TILE_M, TILE_N, K_CHUNK) instantiation that would exceed
+     * the budget must fail at compile time with a clear message, not
+     * surprise us at hardware run. The 65536 bound is conservative; if
+     * Xe3+ or a different target exposes more, this can be widened in
+     * one place. */
+    constexpr std::size_t KV1_A_SLAB_BYTES =
+        static_cast<std::size_t>(TILE_M) *
+        static_cast<std::size_t>(K_CHUNK) *
+        sizeof(std::uint16_t);
+    constexpr std::size_t KV1_B_SLAB_BYTES =
+        static_cast<std::size_t>(K_CHUNK / 256u) *
+        static_cast<std::size_t>(TILE_N) *
+        sizeof(bitnet_arc_tq2_0_block);
+    constexpr std::size_t KV1_SLM_BUDGET_BYTES = 64u * 1024u;
+    static_assert(KV1_A_SLAB_BYTES + KV1_B_SLAB_BYTES
+                      <= KV1_SLM_BUDGET_BYTES,
+                  "kv1: A_slab + B_slab exceeds Xe2 64 KB SLM/WG hard "
+                  "limit -- pick smaller TILE_M, TILE_N, or K_CHUNK, or "
+                  "widen KV1_SLM_BUDGET_BYTES if targeting a device with "
+                  "more SLM/WG");
+
     /* Host-side preconditions. */
     assert(M > 0 && "kv1: M must be > 0");
     assert(N > 0 && "kv1: N must be > 0");
