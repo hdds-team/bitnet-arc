@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-bitnet-arc #147 stop-gate logic for the W1/W2 bandwidth thresholds.
+bitnet-arc #147 stop-gate logic.
 
 Consumes a CSV produced by bench/sweep_tile.cpp (or any compatible
-producer) and emits a per-shape summary plus an outlier list. Reports
-correctness failures and FP16 overflow events independently from the
-performance gate.
+producer) and emits a per-shape summary, a per-variant verdict
+table, and an outlier list. Reports correctness failures and FP16
+overflow events independently from the performance gate.
 
 Default mode is dry-run: the script always exits 0 and just prints a
-report. Pass --strict-gates to make it exit 1 on any violation. This
-matches the design v0 #147 contract (calibrate first, gate later).
+report. Pass --strict-gates to make it exit 1 on any error-severity
+violation. This matches the design v0 #147 contract (calibrate
+first, gate later).
 
 CSV format (lenient parser, header keyed by name):
 
@@ -22,14 +23,30 @@ diagnostic from stderr if the user redirected 2>&1) are recognized
 and reported separately. Anything else that does not parse cleanly is
 flagged as a parse error (still non-fatal in dry-run).
 
-The W1/W2 thresholds (% of peak BW) are *provisional* per design v0;
-they will be calibrated on the first real Arc B60 sweep -- see
-review #62. Override via --w1-pct / --w2-pct.
+Gate model (post claude-opus brief, post first Arc B60 smoke -- the
+absolute %peak thresholds from design v0 were invalidated by the v0
+baseline being ~0.07% of HBM peak):
+
+    W1 (correctness)   : per-variant correct=YES AND
+                         over_threshold==0.  Hard gate.
+    W2 (speedup)       : per-variant bw / baseline_bw >=
+                         --min-speedup (default 1.5x). Warn in
+                         dry-run, error in --strict-gates.
+    Outlier            : bw < --outlier-frac (=0.7) * shape_mean.
+                         Always a warning.
+    Soft peak (info)   : best variant < --soft-peak-pct (=0.5%) of
+                         HBM peak. Diagnostic only, never fails.
+
+The baseline variant defaults to '16x16_sg16_BRANCHFUL' (matches
+design v0 narrative); falls back to slowest runnable variant in the
+shape if absent and emits a 'baseline_missing' warning. Override
+via --baseline-variant.
 
 Usage:
     python3 gate_w1w2.py path/to/sweep.csv
     python3 gate_w1w2.py --strict-gates path/to/sweep.csv
-    python3 gate_w1w2.py --peak-gbs 456 --w1-pct 50 --w2-pct 60 ...
+    python3 gate_w1w2.py --csv-out v.csv path/to/sweep.csv
+    python3 gate_w1w2.py --min-speedup 2.0 --baseline-variant ... ...
 """
 
 from __future__ import annotations
