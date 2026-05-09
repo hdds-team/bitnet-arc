@@ -27,8 +27,8 @@ CXXFLAGS:= -O2 -std=c++17 -Wall -Wextra -fsycl
 
 INCLUDES := -I. -I..
 
-OBJS    := kernel_v0.o kernel_v1.o kernel_v2.o
-HEADERS := kernel_v0.h kernel_v1.h kernel_v2.h kernel_v0_sycl.hpp ../oracle/tq2_0.h
+OBJS    := kernel_v0.o kernel_v1.o kernel_v2.o kernel_v4.o
+HEADERS := kernel_v0.h kernel_v1.h kernel_v2.h kernel_v4.h kernel_v4_packing.h kernel_v0_sycl.hpp ../oracle/tq2_0.h
 
 # Library name kept as v0 for backward compat with bench/Makefile (the
 # archive aggregates v0 + v1 + v2 kernel translation units; each new
