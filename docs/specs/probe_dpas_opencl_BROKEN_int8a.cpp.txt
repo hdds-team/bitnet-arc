@@ -1,24 +1,29 @@
 /*
  * bench/probe_dpas_opencl.cpp -- Path A Phase 0 v4 hardstop gate.
  *
- * Per docs/design-v3.md sec6.0 + 3-voice strategic vote (commit 9f8e03d
- * later invalidated by output validation FAIL on first kernel attempt).
+ * Per docs/design-v3.md sec6.0 + post-vote synthesis (commit 8388c37
+ * + 3-voice vote 2-1 for Option B with Phase 0 garde-fou).
  *
- * 2-voice spec-vs-code review (post first FAIL) confirmed 5+ accumulated
- * bugs from incremental edits and identified the canonical fix from
- * docs/specs/cl_intel_subgroup_matrix_multiply_accumulate.asciidoc:
+ * Tests if the `cl_intel_subgroup_matrix_multiply_accumulate` OpenCL
+ * extension (exposed by Arc B60 compute runtime per clinfo) actually
+ * delivers higher throughput than the SYCL `joint_matrix` wrapper
+ * which Phase 0.5 falsified at 1.0x FP16 throughput.
  *
- *   - Spec line 140 (SG=16, M=4):
- *       int4 intel_sub_group_i8_i8_matrix_mad_k32(short4 a, int8 b, int4 acc)
- *   - Spec lines 72-74: calling SG=8 overload on SG=16 device = UB.
- *   - Arc B60 supports SG=16 and SG=32 only (clinfo confirmed).
+ * Standalone OpenCL host program (no SYCL involvement) so we bypass
+ * the icpx 2025.3 SYCL header layer entirely. Uses OpenCL C API +
+ * Intel-specific kernel builtin `intel_sub_group_i8_i8_matrix_mad_k32`
+ * inside an OpenCL kernel string.
  *
- * This rewrite uses M=4 first (smaller, easier to validate per reviewer
- * #2 recommendation). The M=8 variant follows the same pattern with
- * `short8 a` + `int8 b` + `int8 acc` if M=4 path validates.
+ * Acceptance gate (per design v3 sec6.0 + Sonnet risk-reward fold):
+ *   PASS     : INT8 DPAS direct >= 2x SYCL wrapper FP16 baseline
+ *              (~93.6 GOps/s from probe_dpas_throughput.cpp run)
+ *              -> Path B unlocked, design v4 brief drafting starts.
+ *   MARGINAL : 1.5x to 2x -> proceed Path B with reduced expectations.
+ *   FAIL     : <1.5x or compile/link fail
+ *              -> Path B blocked, escalate v4 = D (ship as-is).
  *
- * Build: bench/Makefile target probe_dpas_opencl. Standalone OpenCL,
- * no SYCL dependency.
+ * Build: bench/Makefile target probe_dpas_opencl.
+ * Standalone, requires only libOpenCL.so + Arc B60 compute runtime.
  */
 
 #define CL_TARGET_OPENCL_VERSION 300
@@ -36,39 +41,46 @@
 namespace {
 
 const char* g_kernel_src = R"CLC(
-#pragma OPENCL EXTENSION cl_intel_subgroup_matrix_multiply_accumulate : enable
-
-// SG=16, M=8, K=32, N=16 (=SG_size). Full DPAS-unit utilization.
-// Per spec line 141 (docs/specs/cl_intel_*.asciidoc):
-//   int8 intel_sub_group_i8_i8_matrix_mad_k32(short8 a, int8 b, int8 acc)
+// OpenCL 3.0 kernel using cl_intel_subgroup_matrix_multiply_accumulate.
+// Forces sub_group_size = 16 to match Arc B60 / Xe2 native DPAS.
 //
-// Per-lane storage:
-//   - short8 a : 8 shorts × 2 int8/short = 16 int8 per lane
-//                SG=16 lanes × 16 int8 = 256 int8 = M*K = 8*32 ✓
-//   - int8 b   : 8 ints × 4 int8/int  = 32 int8 per lane
-//                SG=16 lanes × 32 int8 = 512 int8 = K*N = 32*16 ✓
-//   - int8 acc : 8 int32 per lane
-//                SG=16 lanes × 8 int32 = 128 int32 = M*N = 8*16 ✓
+// Builtin signature for SG=8 spec is:
+//   int8 intel_sub_group_i8_i8_matrix_mad_k32(int8 a, int8 b, int8 acc)
+// For SG=16, M=8, K=32, N=16, the per-lane storage redistributes; we
+// try the same canonical signature first and adjust if the compiler
+// rejects it.
+//
+// MMA op count per call: M*N*K*2 = 8*16*32*2 = 8192 ops (8x16x32 int8
+// matmul, 1 mul + 1 add per lane-position-step).
+
+// Debug version: write a marker to confirm the kernel runs at all,
+// then try M=4 signature with buffer-based inputs (avoid constant
+// init which may be optimized weirdly).
 __attribute__((intel_reqd_sub_group_size(16)))
 __kernel void dpas_int8_throughput(const int n_reps,
+                                   __global const int* a_in,
+                                   __global const int* b_in,
                                    __global int* output)
 {
-    const short s = 0x0101;
-    const int   p = 0x01010101;
-    short8 a   = (short8)(s, s, s, s, s, s, s, s);
-    int8   b   = (int8)(p, p, p, p, p, p, p, p);
-    int8   acc = (int8)(0, 0, 0, 0, 0, 0, 0, 0);
+    const int gid = get_global_id(0);
+
+    // Load per-lane inputs from buffers. a is int4 (M=4), b is int8.
+    int4 a   = (int4)(a_in[gid * 4 + 0], a_in[gid * 4 + 1],
+                      a_in[gid * 4 + 2], a_in[gid * 4 + 3]);
+    int8 b   = (int8)(b_in[gid * 8 + 0], b_in[gid * 8 + 1],
+                      b_in[gid * 8 + 2], b_in[gid * 8 + 3],
+                      b_in[gid * 8 + 4], b_in[gid * 8 + 5],
+                      b_in[gid * 8 + 6], b_in[gid * 8 + 7]);
+    int4 acc = (int4)(0, 0, 0, 0);
 
     for (int i = 0; i < n_reps; ++i) {
         acc = intel_sub_group_i8_i8_matrix_mad_k32(a, b, acc);
     }
 
-    // With all-byte=1 inputs, each acc[m, n] += sum_{k=0..31}(1*1) = 32
-    // per MMA. After n_reps iters, each of the 8 acc elements per lane
-    // is 32 * n_reps. Per-lane sum (.s0..s7) = 8 * 32 * n_reps = 256 * n_reps.
-    const int gid = get_global_id(0);
-    output[gid] = acc.s0 + acc.s1 + acc.s2 + acc.s3
-                + acc.s4 + acc.s5 + acc.s6 + acc.s7;
+    // Write per-lane sum. M=4 -> per acc element after n_reps reps
+    // with all-byte=1 inputs: 32*n_reps. Per-lane sum (acc.s0..s3) =
+    // 4 * 32 * n_reps = 128 * n_reps.
+    output[gid] = acc.s0 + acc.s1 + acc.s2 + acc.s3;
 }
 )CLC";
 
@@ -118,7 +130,7 @@ double event_ms(cl_event e) {
                             sizeof(t0), &t0, nullptr);
     clGetEventProfilingInfo(e, CL_PROFILING_COMMAND_END,
                             sizeof(t1), &t1, nullptr);
-    return double(t1 - t0) / 1.0e6;
+    return double(t1 - t0) / 1.0e6;  /* ns -> ms */
 }
 
 } /* anonymous namespace */
@@ -153,9 +165,9 @@ int main() {
         ctx, 1, &g_kernel_src, nullptr, &err);
     check(err, "clCreateProgramWithSource");
 
-    /* No -cl-fast-relaxed-math (per reviewer #1: integer ops + UB
-     * doesn't combine well; kept clean). */
-    const char* build_opts = "-cl-std=CL3.0";
+    const char* build_opts =
+        "-cl-std=CL3.0 "
+        "-cl-mad-enable -cl-fast-relaxed-math";
     err = clBuildProgram(prog, 1, &dev, build_opts, nullptr, nullptr);
     if (err != CL_SUCCESS) {
         std::size_t log_sz = 0;
@@ -165,13 +177,18 @@ int main() {
         clGetProgramBuildInfo(prog, dev, CL_PROGRAM_BUILD_LOG,
                               log_sz, log.data(), nullptr);
         std::fprintf(stderr, "BUILD FAIL:\n%s\n", log.data());
+        std::fprintf(stderr,
+                     "FAIL: kernel did not compile. The builtin signature "
+                     "may differ for SG=16 on this driver. Path B blocked "
+                     "until the correct signature is found.\n");
         return 1;
     }
-    std::fprintf(stderr, "OK: kernel compiled.\n");
+    std::fprintf(stderr, "OK: kernel compiled successfully.\n");
 
     cl_kernel kern = clCreateKernel(prog, "dpas_int8_throughput", &err);
     check(err, "clCreateKernel");
 
+    /* Output buffer: 1 int per lane, 16 lanes per WG, 1 WG = 16 ints. */
     constexpr std::size_t NUM_LANES = 16;
     cl_mem dout = clCreateBuffer(
         ctx, CL_MEM_READ_WRITE,
@@ -179,6 +196,8 @@ int main() {
     check(err, "clCreateBuffer");
 
     auto run_one = [&](int n_reps, bool validate) -> double {
+        /* Zero the output buffer before each run so the post-run check
+         * actually verifies the kernel wrote something. */
         const cl_int zero = 0;
         check(clEnqueueFillBuffer(q, dout, &zero, sizeof(cl_int),
                                   0, NUM_LANES * sizeof(cl_int),
@@ -194,17 +213,25 @@ int main() {
             q, kern, 1, nullptr, &global, &local, 0, nullptr, &evt);
         if (enq_err != CL_SUCCESS) {
             std::fprintf(stderr,
-                "kernel enqueue failed err=%d (n_reps=%d)\n",
+                "kernel enqueue failed err=%d (n_reps=%d) -- GPU hang?\n",
                 enq_err, n_reps);
             std::exit(2);
         }
-        check(clWaitForEvents(1, &evt), "clWaitForEvents");
+        const cl_int wait_err = clWaitForEvents(1, &evt);
+        if (wait_err != CL_SUCCESS) {
+            std::fprintf(stderr,
+                "kernel wait failed err=%d (n_reps=%d) -- GPU reset?\n",
+                wait_err, n_reps);
+            clReleaseEvent(evt);
+            std::exit(3);
+        }
         cl_int exec_status = 0;
         clGetEventInfo(evt, CL_EVENT_COMMAND_EXECUTION_STATUS,
                        sizeof(exec_status), &exec_status, nullptr);
         if (exec_status != CL_COMPLETE) {
             std::fprintf(stderr,
-                "kernel did not COMPLETE (status=%d, n_reps=%d)\n",
+                "kernel did not COMPLETE (status=%d, n_reps=%d) -- "
+                "GPU reset?\n",
                 exec_status, n_reps);
             clReleaseEvent(evt);
             std::exit(4);
@@ -212,10 +239,14 @@ int main() {
         const double ms = event_ms(evt);
         clReleaseEvent(evt);
 
-        /* For M=8, all-byte=1 inputs:
-         *   each acc[m, n] = K * n_reps = 32 * n_reps
-         *   per-lane sum (.s0..s7) = 8 * 32 * n_reps = 256 * n_reps
-         */
+        /* Validate: with a=(1,1,...,1), b=(1,1,...,1) and the
+         * dot-product semantic of intel_sub_group_i8_i8_matrix_mad_k32
+         * (K=32 multiplies + accumulate), each MMA adds K=32 to each
+         * acc element. After n_reps iters, each of the 8 acc elements
+         * holds 32 * n_reps. The kernel writes the lane-sum
+         *   acc.s0 + acc.s1 + ... + acc.s7 = 8 * 32 * n_reps
+         *                                 = 256 * n_reps
+         * to output[lane]. This validates the kernel actually ran. */
         if (validate) {
             std::vector<cl_int> host_out(NUM_LANES, -1);
             check(clEnqueueReadBuffer(q, dout, CL_TRUE, 0,
@@ -240,26 +271,21 @@ int main() {
         return ms;
     };
 
-    /* Validation pass: smallest N_REPS first, confirm DPAS actually
-     * runs and produces correct output. */
+    std::vector<int> reps_list = {500, 1000, 2000, 5000};
+    constexpr unsigned warmups = 5, timed = 25;
+    constexpr double OPS_PER_MMA = 8.0 * 16.0 * 32.0 * 2.0;  /* 8192 */
+
+    std::printf("variant,N_REPS,t_ms_med,ops_per_mma,gops_per_s\n");
+
+    /* Smallest n_reps validate run first: confirms the kernel actually
+     * computes the expected pattern, before we trust any timing. */
     {
         const double validate_ms = run_one(50, true);
         std::fprintf(stderr,
                      "VALIDATION OK at n_reps=50, t=%.4f ms (kernel "
-                     "wrote 256*50=12800 in all %zu lanes, MMA confirmed)\n",
+                     "wrote correct pattern in all %zu lanes)\n",
                      validate_ms, NUM_LANES);
     }
-
-    std::vector<int> reps_list = {500, 1000, 2000, 5000};
-    constexpr unsigned warmups = 5, timed = 25;
-    /* M=8, K=32, N=16: ops_per_MMA = M*N*K*2 = 8*16*32*2 = 8192.
-     * Note: this is 2x more ops/MMA than FP16 16x16x16 (4096), so
-     * a 2x GOps/s ratio reflects "same wall-clock time per call",
-     * NOT extra silicon throughput. The genuine DPAS speedup
-     * (vs FP16) is ratio - 1 of any extra silicon parallelism. */
-    constexpr double OPS_PER_MMA = 8.0 * 16.0 * 32.0 * 2.0;  /* 8192 */
-
-    std::printf("variant,N_REPS,t_ms_med,ops_per_mma,gops_per_s\n");
 
     double med_at_2k = 0;
     for (int n_reps : reps_list) {
@@ -278,7 +304,8 @@ int main() {
                      n_reps, med, gops);
         if (n_reps == 2000) med_at_2k = med;
     }
-    /* End-of-run validation: confirm GPU still healthy. */
+    /* One more validation pass at the largest n_reps used, to confirm
+     * the GPU was still healthy at the END of the bench run. */
     {
         const double validate_ms = run_one(reps_list.back(), true);
         std::fprintf(stderr,
@@ -292,10 +319,10 @@ int main() {
     clReleaseCommandQueue(q);
     clReleaseContext(ctx);
 
-    /* FP16 wrapper baseline: probe_dpas_throughput (commit 8388c37)
-     * measured 16x16x16 FP16 joint_matrix at ~93.6 GOps/s on
-     * N_REPS=2000 = same 4096 ops/MMA -> direct GOps/s comparison.
-     * This is the apples-to-apples ratio. */
+    /* Verdict gate per design v3 sec6.0 (revised post Phase 0.5).
+     * Baseline: probe_dpas_throughput.cpp commit 8388c37 measured FP16
+     * SYCL wrapper at ~93.6 GOps/s on N_REPS=2000 = ~0.0876 ms per
+     * 2000-rep kernel. We compare DPAS direct against this. */
     constexpr double BASELINE_FP16_GOPS = 93.6;
     if (med_at_2k <= 0.0) {
         std::fprintf(stderr,
@@ -305,28 +332,25 @@ int main() {
     const double gops_at_2k = (2000.0 * OPS_PER_MMA) / (med_at_2k * 1e6);
     const double ratio = gops_at_2k / BASELINE_FP16_GOPS;
     std::fprintf(stderr,
-                 "\nDPAS direct (M=8) at N_REPS=2000: %.1f GOps/s\n"
-                 "FP16 wrapper baseline (commit 8388c37, MMA 4096 ops): %.1f GOps/s\n"
-                 "INT8 DPAS / FP16 wrapper throughput ratio: %.3fx\n"
-                 "  NOTE: M=8 INT8 packs 2x more ops/MMA than FP16 16x16x16,\n"
-                 "  so a ratio = 2.0x means same wall-clock per call (not\n"
-                 "  extra silicon parallelism). True silicon advantage is\n"
-                 "  visible only if ratio > 2.0x.\n",
+                 "\nDPAS direct at N_REPS=2000: %.1f GOps/s\n"
+                 "FP16 wrapper baseline (commit 8388c37): %.1f GOps/s\n"
+                 "INT8 / FP16 throughput ratio: %.3fx\n",
                  gops_at_2k, BASELINE_FP16_GOPS, ratio);
     if (ratio >= 2.0) {
         std::fprintf(stderr,
-                     "phase 0 v4 PASS: DPAS direct >= 2x FP16 wrapper. "
-                     "Path B unlocked.\n");
+                     "phase 0 v4 PASS: DPAS direct >= 2x FP16 wrapper "
+                     "(unlocks Path B). Design v4 brief drafting starts.\n");
         return 0;
     } else if (ratio >= 1.5) {
         std::fprintf(stderr,
                      "phase 0 v4 MARGINAL: 1.5x <= ratio < 2x. Path B "
-                     "may proceed with reduced expectation on W2.\n");
+                     "may proceed but with reduced expectation on W2.\n");
         return 0;
     } else {
         std::fprintf(stderr,
                      "phase 0 v4 FAIL: ratio < 1.5x. DPAS direct does not "
-                     "deliver structural speedup. Escalate v4 = D.\n");
+                     "deliver the structural speedup. Escalate v4 = D "
+                     "(ship as-is) per design v3 sec6.3.\n");
         return 1;
     }
 }
