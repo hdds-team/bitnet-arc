@@ -185,10 +185,23 @@ void run_kernel_v4(sycl_queue_handle& q_handle,
 
     sycl::queue& q = q_handle.q;
 
+    /* 0. The inputs A_fp16 / B_blocks are USM device pointers (per
+     * bench/sweep_tile.cpp). Pull them to host-side staging vectors
+     * so prepack_host can read them. Phase 1 v4 cost: 2 extra memcpys
+     * device->host. Phase 2 v4 optim: port pre-pack to device-side
+     * ESIMD prep kernel to eliminate this round-trip.
+     */
+    const std::size_t A_size = M * K;
+    const std::size_t B_size = (K / 256) * N;
+    std::vector<std::uint16_t> A_host(A_size);
+    std::vector<bitnet_arc_tq2_0_block> B_host(B_size);
+    q.memcpy(A_host.data(), A_fp16,    A_size * sizeof(std::uint16_t)).wait();
+    q.memcpy(B_host.data(), B_blocks,  B_size * sizeof(bitnet_arc_tq2_0_block)).wait();
+
     /* 1. Host pre-pack into staging vectors. */
     std::vector<std::uint32_t> A_packed_h, B_packed_h;
     std::vector<float>         d_per_n_h, s_a_h;
-    prepack_host(M, N, K, A_fp16, B_blocks,
+    prepack_host(M, N, K, A_host.data(), B_host.data(),
                  A_packed_h, B_packed_h, d_per_n_h, s_a_h);
 
     /* 2. Allocate USM device buffers + memcpy from staging. */
@@ -202,6 +215,7 @@ void run_kernel_v4(sycl_queue_handle& q_handle,
     q.memcpy(s_a_dev,  s_a_h.data(),      s_a_h.size()      * sizeof(float)).wait();
 
     /* 3. ESIMD kernel launch: 1 thread per output tile. */
+    try {
     q.submit([&](sycl::handler& h) {
         /* Capture by value: pointers + dims (only those used in the kernel) */
         const auto t_N   = tiles_N;
@@ -281,6 +295,14 @@ void run_kernel_v4(sycl_queue_handle& q_handle,
                 }
             });
     }).wait_and_throw();
+    } catch (const sycl::exception& e) {
+        std::fprintf(stderr, "[kv4] sycl::exception during kernel: %s\n", e.what());
+        sycl::free(A_packed, q);
+        sycl::free(B_packed, q);
+        sycl::free(d_per_n,  q);
+        sycl::free(s_a_dev,  q);
+        throw;
+    }
 
     /* 4. Free staging USM. */
     sycl::free(A_packed, q);
@@ -305,7 +327,7 @@ static void kv4_launch_aint2_8x16x64_k256(
 }
 
 extern const kv4_variant_desc kv4_variants[] = {
-    { KV4_TILE_M, KV4_TILE_N, KV4_TILE_K, KV4_K_CHUNK,
+    { KV4_TILE_M, KV4_TILE_N, KV4_TILE_K, /*sg_size=*/16u, KV4_K_CHUNK,
       /*act_int2=*/true,
       "v4_8x16x64_aint2_k256",
       &kv4_launch_aint2_8x16x64_k256 },

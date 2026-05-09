@@ -27,6 +27,7 @@
 #include "../src/kernel_v0_sycl.hpp"
 #include "../src/kernel_v1.h"
 #include "../src/kernel_v2.h"
+#include "../src/kernel_v4.h"
 #include "../oracle/fp16.h"
 #include "../oracle/tq2_0.h"
 #include "../oracle/fp32_matmul.h"
@@ -57,6 +58,10 @@ using bitnet_arc::kv1_variants_count;
 using bitnet_arc::kv2_variant_desc;
 using bitnet_arc::kv2_variants;
 using bitnet_arc::kv2_variants_count;
+
+using bitnet_arc::kv4_variant_desc;
+using bitnet_arc::kv4_variants;
+using bitnet_arc::kv4_variants_count;
 using bitnet_arc::sycl_queue_handle;
 
 /* --- input generation ------------------------------------------------ */
@@ -466,6 +471,56 @@ int run_shape(const shape_t& sh,
             "%s,%zu,%zu,%zu,%u,%u,%u,%s,%.4f,%.4f,%.0f,%.2f,%s,%.3g,%zu\n",
             v.name, M, N, K,
             v.tile_M, v.tile_N, v.sg_size, "BRANCHLESS",
+            s.time_ms_med, s.time_ms_min,
+            total_bytes, s.bandwidth_gbs,
+            s.correct ? "YES" : "NO",
+            s.max_rel_err, s.over_threshold);
+        std::fflush(stdout);
+    }
+
+    /* kv4: ESIMD INT2 ternary path (design v4 ratified 99c4237).
+     * 1 ESIMD thread per output tile; INT2 silicon-native via xmx::dpas
+     * + dpas_argument_type::s2. Phase 0.5 v4 throughput probe (commit
+     * 5777078) measured 3.76x FP16 wrapper baseline.
+     */
+    for (std::size_t i = 0; i < kv4_variants_count; ++i) {
+        const kv4_variant_desc& v = kv4_variants[i];
+
+        if (K % v.k_chunk != 0) {
+            std::fprintf(stderr,
+                         "skip %s: K not multiple of K_CHUNK "
+                         "(K=%zu, k_chunk=%u)\n",
+                         v.name, K, v.k_chunk);
+            continue;
+        }
+
+        const run_stats s = run_variant(
+            q, q_handle, v, M, N, K,
+            A_dev, B_dev, C_dev,
+            C_ref, C_host,
+            warmup, timed);
+
+        if (!s.ran) {
+            std::fprintf(stderr,
+                         "skip %s: %s (M=%zu, N=%zu, tile=%ux%u)\n",
+                         v.name, s.skip_reason, M, N, v.tile_M, v.tile_N);
+            continue;
+        }
+
+        const double w_bytes = static_cast<double>(N) *
+                               (static_cast<double>(K) / 256.0) *
+                               static_cast<double>(sizeof(bitnet_arc_tq2_0_block));
+        const double a_b = static_cast<double>(M) * static_cast<double>(K) *
+                           sizeof(std::uint16_t);
+        const double o_b = static_cast<double>(M) * static_cast<double>(N) *
+                           sizeof(std::uint16_t);
+        const double total_bytes = w_bytes + a_b + o_b;
+
+        std::printf(
+            "%s,%zu,%zu,%zu,%u,%u,%u,%s,%.4f,%.4f,%.0f,%.2f,%s,%.3g,%zu\n",
+            v.name, M, N, K,
+            v.tile_M, v.tile_N, v.sg_size,
+            v.act_int2 ? "ESIMD_AINT2" : "ESIMD_AINT4",
             s.time_ms_med, s.time_ms_min,
             total_bytes, s.bandwidth_gbs,
             s.correct ? "YES" : "NO",

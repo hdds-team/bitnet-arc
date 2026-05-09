@@ -121,6 +121,7 @@ struct kv4_variant_desc {
     unsigned       tile_M;
     unsigned       tile_N;
     unsigned       tile_K;
+    unsigned       sg_size;    /* 16 for ESIMD Xe2 (kept for sweep_tile printf compat) */
     unsigned       k_chunk;
     bool           act_int2;   /* true = W1.58A2, false = W1.58A4 */
     const char*    name;       /* "v4_8x16x64_aint2_k256" etc. */
