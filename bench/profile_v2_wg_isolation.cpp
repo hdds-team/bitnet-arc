@@ -379,46 +379,93 @@ int main(int argc, char** argv) {
         }
         std::fflush(stdout);
 
-        /* stderr summary per K. */
+        /* stderr summary per K. The VERDICT-bearing comparison is
+         * wall_clock TOTAL (single vs multi), per the post-Arc-B60-run
+         * methodology correction (claude-opus + theta + beta).
+         *
+         * `per_wg_med = total / wg_count` is *diagnostic only* -- it is
+         * NOT a real per-WG time when the WGs run in true parallel
+         * (which they do on Xe cores for this kernel). 64 WGs taking
+         * 5.3 ms total means each WG took ~5 ms running concurrently,
+         * not 5.3/64 = 0.083 ms each. The previous interpretation
+         * guide built on per_wg_med ratios was methodologically wrong;
+         * see #85 review thread + Arc B60 run K=14336 (5.13 vs 5.30
+         * ms total) as the empirical correction. */
         std::fprintf(stderr,
-            "%-13s [K=%5zu] single (1 WG): t_med=%.3f ms (jitter %.3f-%.3f)\n",
+            "%-13s [K=%5zu] single (1 WG):   total=%.3f ms (jitter %.3f-%.3f)\n",
             p.tag, p.K, single.stats.t_med,
             single.stats.t_min, single.stats.t_max);
         std::fprintf(stderr,
-            "%-13s [K=%5zu] multi (64 WGs): t_med=%.3f ms total -> "
-            "%.4f ms/WG (jitter %.3f-%.3f)\n",
-            p.tag, p.K, multi.stats.t_med, multi.per_wg_med,
+            "%-13s [K=%5zu] multi (64 WGs):  total=%.3f ms (jitter %.3f-%.3f)\n",
+            p.tag, p.K, multi.stats.t_med,
             multi.stats.t_min, multi.stats.t_max);
-        std::fprintf(stderr,
-            "%-13s [K=%5zu] RATIO single_per_wg / multi_per_wg = %.3f\n\n",
-            p.tag, p.K, ratio);
+
+        /* Verdict comparison : wall_clock TOTAL ratio. Close to 1.0 =
+         * intra-WG bottleneck (single WG already takes ~ multi-WG total
+         * because each WG carries the same intra-WG work load). The
+         * old `single_per_wg / multi_per_wg` ratio is preserved in the
+         * CSV for debugging but the interpretation below uses the new
+         * comparator. */
+        const double total_ratio = (multi.stats.t_med > 0.0)
+                                   ? single.stats.t_med / multi.stats.t_med
+                                   : std::nan("");
+        if (std::isnan(total_ratio)) {
+            std::fprintf(stderr,
+                "%-13s [K=%5zu] WALL-CLOCK ratio (single/multi) = nan "
+                "(invalid timing)\n\n",
+                p.tag, p.K);
+        } else {
+            std::fprintf(stderr,
+                "%-13s [K=%5zu] WALL-CLOCK ratio (single/multi) = %.3f\n\n",
+                p.tag, p.K, total_ratio);
+        }
     }
 
-    /* Final heuristic. Conservative thresholds : ratio in [0.7, 1.5]
-     * is treated as "intra-WG dominant" (true parallel WGs, single-WG
-     * launch-latency bias accounts for the spread). Outside that band
-     * suggests an inter-WG effect worth investigating before step 2. */
+    /* Final heuristic, REVISED post Arc B60 run + theta/beta protocol
+     * correction. The verdict-bearing metric is wall_clock TOTAL (not
+     * per_wg_med, which is diagnostic-only as explained per-K above).
+     *
+     * Launch-latency caveat (claude-opus catch on Arc B60 K=4096
+     * dataset) : at short K the ~1-2 ms SYCL launch overhead dominates
+     * the kernel time, so the ratio is biased away from 1.0 even when
+     * the underlying intra-WG hypothesis holds. Empirical threshold
+     * from the K=4096 vs K=14336 contrast : K < ~8192 should be
+     * treated as launch-bound (heuristic excludes it from the verdict).
+     * A future step 2 add-meas (SYCL events at-submit / at-end) will
+     * isolate the launch latency directly; until then K >= 14336 is
+     * the trustworthy band for the verdict. */
     std::fprintf(stderr,
-        "interpretation guide :\n"
-        "  ratio ~ 1.0 (range [0.7, 1.5])   -> intra-WG bottleneck CONFIRMED\n"
-        "                                      (each WG carries ~constant\n"
-        "                                      work, true parallel exec)\n"
-        "                                      step 2 split-build is the\n"
-        "                                      right next move.\n"
-        "  ratio < 0.7                      -> single WG much faster than\n"
-        "                                      per-WG share of multi.\n"
-        "                                      Inter-WG contention likely\n"
-        "                                      (SLM banks, dispatcher).\n"
-        "                                      Re-think step 2 design.\n"
-        "  ratio > 1.5                      -> single WG slower per WG\n"
-        "                                      than the multi share.\n"
-        "                                      Pure launch-latency bias\n"
-        "                                      dominates ; report shows\n"
-        "                                      noise floor only.\n"
-        "  K-dependence (4096 vs 14336)     -> if the ratio differs\n"
-        "                                      strongly between best and\n"
-        "                                      worst shape, report it ;\n"
-        "                                      may suggest K-scaled SLM\n"
-        "                                      or barrier behavior.\n");
+        "interpretation guide (VERDICT = wall_clock TOTAL ratio,\n"
+        "                      per_wg_med is diagnostic only) :\n"
+        "  total_ratio ~ 1.0 (within jitter)  -> intra-WG bottleneck CONFIRMED\n"
+        "                                        (each WG carries the same\n"
+        "                                        intra-WG work, single & multi\n"
+        "                                        finish in the same wall-clock).\n"
+        "                                        Step 2 split-build is the\n"
+        "                                        right next move.\n"
+        "  total_ratio significantly > 1.0    -> single WG slower than multi\n"
+        "                                        (which is the expected sign).\n"
+        "                                        K likely too short -- launch\n"
+        "                                        latency dominates the single-WG\n"
+        "                                        wall-clock. Exclude this K\n"
+        "                                        from the verdict.\n"
+        "  total_ratio significantly < 1.0    -> single WG faster than multi\n"
+        "                                        per wall-clock = unexpected.\n"
+        "                                        Suggests inter-WG effect\n"
+        "                                        (dispatcher serialization,\n"
+        "                                        SLM bank contention) -- step 2\n"
+        "                                        design must reconsider.\n"
+        "  K-dependent caveat (claude-opus catch, Arc B60) :\n"
+        "    K < ~8192 : launch-latency bias > intra-WG signal. Empirically\n"
+        "                K=4096 gave total_ratio=1.77 (single 2.62 ms, multi\n"
+        "                1.48 ms) which is launch-overhead-dominated, NOT a\n"
+        "                negative result. K=14336 gave total_ratio=0.97\n"
+        "                (single 5.13 ms, multi 5.30 ms) which is the clean\n"
+        "                intra-WG signal. Treat K>=14336 as the trustworthy\n"
+        "                band until SYCL-events isolation lands (step 2 TODO).\n"
+        "\n"
+        "  TODO step 2 add-meas : SYCL events at-submit / at-end to isolate\n"
+        "  the launch latency directly. Once that lands, the K<8192 band\n"
+        "  becomes interpretable too (current heuristic excludes it).\n");
     return 0;
 }
