@@ -52,6 +52,16 @@ profile_v2: profile_v2.cpp $(KERNEL_LIB) $(ORACLE_LIB) $(HEADERS) ../src/kernel_
 	$(CXX_SYCL) $(SYCLFLAGS) $(INCLUDES) profile_v2.cpp \
 	    $(KERNEL_LIB) $(ORACLE_LIB) -o $@
 
+# Task #160 / Phase 2a step 1.5 -- single-WG isolation test.
+# Per @theta review #83 suggestion #1 : preliminary to step 2 split-
+# build. Validates the intra-WG bottleneck hypothesis (vs an inter-WG
+# contention alternative) by comparing per-WG time at WG_count = 1 vs
+# WG_count = 64 across 2 K shapes (best K=4096, worst K=14336).
+# See bench/profile_v2_wg_isolation.cpp header for full methodology.
+profile_v2_wg_isolation: profile_v2_wg_isolation.cpp $(KERNEL_LIB) $(ORACLE_LIB) $(HEADERS) ../src/kernel_v2.h
+	$(CXX_SYCL) $(SYCLFLAGS) $(INCLUDES) profile_v2_wg_isolation.cpp \
+	    $(KERNEL_LIB) $(ORACLE_LIB) -o $@
+
 # Task #156 / design v2 Phase 0 -- joint_matrix availability probe.
 # Standalone (no kernel_v0 lib needed): only links libc++ + the oracle
 # fp16 helpers via header. Same icpx toolchain.
@@ -89,6 +99,7 @@ gate-strict:
 	python3 gate_w1w2.py --strict-gates $(GATE_CSV)
 
 clean:
-	rm -f harness_3way sweep_tile profile_v0_bl profile_v2 probe_joint_matrix
+	rm -f harness_3way sweep_tile profile_v0_bl profile_v2 \
+	      profile_v2_wg_isolation probe_joint_matrix
 
 .PHONY: clean run run-sweep run-sweep-llm gate gate-strict
