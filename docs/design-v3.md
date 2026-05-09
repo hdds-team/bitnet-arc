@@ -39,8 +39,10 @@ materialization step has no analogue in v0_BL's scalar inline
 pattern. Path A eliminates that step entirely (ternary codes → INT8
 directly, no FP16 conversion for the multiply).
 
-3-voice strategic vote (4/4 unanimous for B = Path A, with the
-Phase 0 probe gate):
+3-voice strategic vote (3/3 unanimous for B = Path A, with the
+Phase 0 probe gate; lead alignment recorded separately, not counted
+in the tally per Phase 2b 3-voice review #X opus-strategic-fold-1
+"clean up self-stacked vote"):
 - Sonnet (pragmatic ship-readiness): "8× compute headroom + Phase 0
   probe time-boxes the unknown unknowns."
 - Sonnet (risk-reward): "Path A attaque la cause racine
@@ -48,7 +50,8 @@ Phase 0 probe gate):
 - Opus (long-term strategic): "Maximise ecosystem + Intel DevRel +
   futur-ternary; first SYCL kernel exercising DPAS sur Arc Pro
   B60 = exactement le signal Intel partage."
-- Claude-opus lead: same.
+
+Lead (claude-opus) aligned with the unanimous panel.
 
 ---
 
@@ -146,22 +149,75 @@ joint_matrix MMA, and adding an activation quant step:
    A_int8 from global. Phase 1 v3 ships with §3.4 done once at
    kernel entry (cleaner separation).
 
-4. **§3.7 Inner DPAS MMA loop**: 8 fragment-K steps per K_CHUNK (vs
-   16 in kv2). Each step issues one `joint_matrix_mad` with INT8
-   ops + INT32 acc. Accumulator `mC_i32` stays in registers across
-   all FRAGS_PER_CHUNK steps and across all K_CHUNK outer iterations.
+4. **§3.7 Inner DPAS MMA loop (revised post review #X for per-chunk
+   d fold blocker, sonnet-SYCL #5)**:
 
-5. **§3.8 Final FP16 store** (extends v2 §3.5): mC_i32 + s_a[m] +
-   s_b[n] → FP32 → FP16 → C_fp16. The two scales need to multiply
-   in:
+   *Critical structural change vs kv2*: kv2 kept `mC_fp32` in
+   registers across ALL chunks because FP16 dequant scales were
+   folded *into B_slab* (each B element was already `code * d` in
+   FP16). For Path A INT8 DPAS, B_int8_slab carries raw ternary
+   codes `{-1, 0, +1}`; the per-block scales `d` (FP16, 1 per
+   chunk per column) cannot be folded into the INT8 fragment
+   without precision loss. Per-chunk d MUST be applied *between*
+   chunks, breaking the kv2 register-only accumulator pattern.
+
+   Phase 1 v3 pattern (4-level loop):
    ```
-   c_fp16[m, n] = fp32_to_fp16(
-       float(mC_i32[m, n]) * s_a[m] * s_b[n] / scale_correction
-   )
+   mC_fp32_slab in SLM = zero-init  // TILE_M*TILE_N FP32 = 512 bytes
+   for chunk c in 0..chunks_per_col:
+       mC_i32 fragment = fill(0)   // chunk-local accumulator, registers
+       // (... §3.5 dequant + §3.6 loadA cooperative SLM fill ...)
+       for k_frag in 0..FRAGS_PER_CHUNK (= 8):
+           load mA, mB from A_q_slab + B_int8_slab
+           mC_i32 = joint_matrix_mad(mA, mB, mC_i32)
+       // Fold this chunk's d into the FP32 accumulator
+       joint_matrix_store(mC_i32 -> mC_i32_slab in SLM)
+       group_barrier(sg)
+       cooperative_scalar_fold(mC_fp32_slab, mC_i32_slab, d_chunk_per_n)
+       group_barrier(sg)
    ```
-   where `scale_correction` accounts for the chunk-level d
-   accumulation pattern (per-chunk d gets folded into mC during
-   accumulation; details in §4.2).
+
+   `cooperative_scalar_fold`: each of the SG_SIZE=16 lanes handles
+   `(TILE_M * TILE_N) / SG_SIZE = 128 / 16 = 8` elements of the
+   8x16 tile. For element `(m, n)`:
+   ```
+   mC_fp32_slab[m, n] += float(mC_i32_slab[m, n]) * d_chunk[n]
+   ```
+   where `d_chunk[n]` is the per-block `d` (FP16, decoded to FP32)
+   for the current chunk's column `n`. The 16 `d_chunk` values
+   are stored in SLM `s_b[TILE_N]` by §3.5 dequant alongside
+   B_int8_slab.
+
+   `mC_i32_slab` is reused SLM staging (8x16 INT32 = 512 bytes;
+   fits in `B_int8_slab`'s 4 KB region after barrier-flushed).
+
+5. **§3.8 Final FP16 store (revised, lane mapping per M=8 / SG=16
+   per review #X sonnet-SYCL #1)**:
+
+   At end of chunk loop, `mC_fp32_slab` holds the fully-accumulated
+   FP32 result. Final store applies the per-row activation scale
+   `s_a` and converts to FP16:
+   ```
+   for each (m, n) in TILE_M × TILE_N:
+       c_fp16[row(m), col(n)] = fp32_to_fp16(
+           mC_fp32_slab[m, n] * s_a[m]
+       )
+   ```
+
+   **Lane mapping caveat**: with TILE_M=8 and SG_SIZE=16, the
+   2-lanes-per-row fragment layout means `lane = m_group + lane_id`
+   (the kv2 pattern) is INCORRECT for kv3. Cooperative store uses
+   linear element distribution: lane `lane_id` handles elements
+   `[lane_id*8 .. lane_id*8+7]` of the flattened 8x16 mC_fp32_slab,
+   regardless of fragment lane mapping. This works because the
+   final store reads from SLM (not from registers), so the SYCL
+   matrix lane-mapping abstraction is irrelevant at this point.
+
+   Replaces the `scale_correction` placeholder from the original
+   draft (per Sonnet-SYCL review #X #3 unresolved formula). There
+   is no `scale_correction` divisor in the final formula because
+   the `d` fold is already in `mC_fp32_slab` (applied per-chunk
+   in §3.7).
 
 ### 3.4 Activation INT8 quantization scheme
 
@@ -170,33 +226,117 @@ Per-row symmetric quant with FP16 scale:
 - `A_q_slab[m, k] = round(A_fp16[m, k] / s_a[m])`, clamped to int8
   range [-128, 127].
 
-Activation quant cost: O(M × K) per kernel call. For (16, 64, 14336)
-that's 16 × 14336 = 229K ops per call, plus a max-reduction. Done
-once at kernel entry, amortized over all M × N output tiles.
+**Sharing model in Phase 1 v3 (post review #X sonnet-pragmatic-2):**
+Each WG (= one output tile) re-quantizes its own M-row strip of A
+into its own private SLM `A_q_slab`. Per-row scales `s_a[0..TILE_M-1]`
+are computed locally (max-reduce across `K` per row, lane-coop). The
+*row* scales are shared across (m, n) tiles that share the same
+m_group: tiles `(m_group, 0)`, `(m_group, 16)`, ... all compute the
+same `s_a[m_group..m_group+7]` independently. This is redundant work
+(each WG does max-reduce on the same A rows), but in Phase 1 it
+keeps the kernel single-launch and simple.
+
+Cost per kernel call (Phase 1 sharing model):
+- Per-WG: TILE_M × K reads + max-reduce (~K/SG_SIZE ops per lane)
+  + TILE_M × K rounds = O(TILE_M × K) per WG.
+- Total across WGs: O(TILE_M × K × tiles_M × tiles_N).
+- For (16, 64, 14336) = 8 × 14336 × 2 × 4 = 920K ops per kernel,
+  ~3% of t_full estimated (vs ~3.5M ops for the matmul itself).
+  Acceptable Phase 1 cost.
+
+**Phase 2 v3 optim (deferred):** if profiler shows act-quant > 10%
+of t_full, factor into a separate kernel launch that writes a
+shared USM `A_q_global` once, then the matmul kernel reads it.
+Reduces total ops from `O(M × K × tiles_N)` to `O(M × K)`. Trade-
+off: launch overhead (~1-2 ms per Phase 2b single-WG bench finding)
+vs the saved redundant work. Phase 2 profiler measures this.
 
 This is W8A8 standard (LLM int8 quant). max_rel_err Phase 2b margin
-(1e-3 vs 1e-2 gate) gives 10× of headroom for the rounding error.
-
-Alternative scheme (deferred to Phase 2 v3 if needed): per-block
-group-quant for tighter accuracy. Not Phase 1 scope.
+(1e-3 vs 1e-2 gate) gives 10× of headroom for the combined rounding
+error (act-quant rounding + per-chunk d fold rounding, see §4.2).
+The combined error budget is verified analytically in Phase 1 W1
+testing; if max_rel_err > 1e-2 on any W1 shape, falls back to
+deferred per-block group-quant scheme.
 
 ---
 
-## 4. SLM budget
+## 4. SLM budget + per-chunk d fold pattern
+
+### 4.1 SLM budget
 
 | Buffer | Size (bytes) |
 |--------|--------------|
 | A_q_slab : TILE_M × K_CHUNK INT8 | 8 × 256 = 2 KB |
 | B_int8_slab : K_CHUNK × TILE_N INT8 | 256 × 16 = 4 KB |
-| s_a : TILE_M FP16 | 16 |
-| s_b : TILE_N FP16 (per-chunk d) | 32 |
+| mC_fp32_slab : TILE_M × TILE_N FP32 (cross-chunk acc) | 8 × 16 × 4 = 512 |
+| mC_i32_slab : TILE_M × TILE_N INT32 (chunk-local staging) | 8 × 16 × 4 = 512 |
+| s_a : TILE_M FP16 (per-row act scale) | 16 |
+| s_b : TILE_N FP16 (per-chunk d; refreshed each chunk) | 32 |
 | qs scratch (if needed for cooperative load) | 64 |
-| **Total** | **~6.1 KB** |
+| **Total** | **~7.2 KB** |
 
 Well under Xe2's 64 KB / WG hard limit (same `static_assert` pattern
-as kv1/kv2). Actually **smaller than kv2's 16 KB** because INT8 takes
-half the bytes of FP16, freeing SLM for potential future fold of
-larger TILE_N or K_CHUNK.
+as kv1/kv2). Still **smaller than kv2's 16 KB** despite the added
+mC_fp32_slab + mC_i32_slab staging (forced by per-chunk d fold,
+§4.2), thanks to INT8 being half-size of FP16.
+
+**Occupancy gain (per Sonnet-SYCL review #X #6, fold)**: at 7.2 KB
+per WG, Xe2's per-Xe-core 64 KB SLM allows up to 8 concurrent WGs
+(vs kv2's 4). This is a Phase 2 v3 perf opportunity to flag for
+the W2 evaluation profiler — kv3 may saturate Xe2 occupancy where
+kv2 was capped, independent of any DPAS speedup.
+
+### 4.2 Per-chunk d fold pattern (the critical correctness blocker
+        identified by review #X SYCL semantics #5)
+
+**The blocker**: kv2's "register-only accumulator across all chunks"
+pattern relied on FP16 dequant pre-folding `d` into B_slab elements.
+For Path A INT8 DPAS, B_int8_slab carries raw ternary codes; the
+per-block `d` cannot be folded into the INT8 fragment without
+precision loss. Different chunks have different `d` values per
+column (1 d per TQ2_0 block), so:
+
+```
+WRONG (kv2 pattern, would lose per-chunk d info):
+    mC_i32 = sum_over_all_chunks(A_int8 @ B_int8)  // d lost
+    c_fp32 = float(mC_i32) * d_some_chunk          // structurally wrong
+
+CORRECT (kv3 pattern, per-chunk fold):
+    mC_fp32 = 0
+    for chunk c:
+        mC_i32_c = sum_over_k_in_chunk(A_int8 @ B_int8_codes)  // raw int
+        mC_fp32 += d_chunk[n] * float(mC_i32_c)                // per-n d
+    c_fp32 = mC_fp32 * s_a[m]                                   // final
+```
+
+The cost of this restructuring:
+- **+1 SLM round-trip per chunk**: `mC_i32` flushes to SLM at end
+  of each chunk, gets read in cooperative scalar fold, then
+  `mC_fp32_slab` updated and SLM-resident across chunks.
+- **+1 sub-group barrier per chunk** (after `joint_matrix_store`)
+  + 1 more after the cooperative scalar fold (before next chunk's
+  MMA reads SLM).
+- For K=14336, 56 chunks: 56 SLM round-trips + 112 barriers added
+  vs kv2's pattern.
+
+This is *less* overhead than kv2 Phase 2b had (Lecture A: 32
+barriers per chunk × 56 chunks = 1792 barriers; Phase 2b Lecture B
+brought that to 0; kv3 brings it to 2 per chunk = 112). Per Phase
+2b empirical profile, barriers themselves were ~0.5% of t_full,
+so this added cost is bounded.
+
+**Alternative fold patterns considered and rejected**:
+- *Per-column scalar accumulator in registers*: would require
+  per-element joint_matrix access (`get_wi_data()` is non-portable
+  Intel-specific extension per review #X SYCL #2). Rejected.
+- *FP32 accumulator joint_matrix*: would need an INT32→FP32
+  joint_matrix conversion API which is not in SYCL2020 ext.
+  Rejected.
+- *Hardcode K=256 (1 chunk only) Phase 1*: would block W1 shapes
+  with K>256 (3 of 4 W1 shapes). Rejected — too restrictive.
+
+The SLM round-trip pattern is the cleanest portable solution. The
+~2 KB SLM staging is well within budget (§4.1).
 
 ---
 
@@ -240,21 +380,69 @@ larger TILE_N or K_CHUNK.
 ## 6. Hardstop / falsification gate
 
 Per the discipline lessons from v1 falsification + v2 falsification
-(both proper sec7 stops):
+(both proper §7 stops). Phase 0.5 v3 added per review #X opus-
+strategic fold #2 ("v2 trap was 3 phases before falsification
+surfaced; need an intermediate gate before kernel work").
 
-- **Phase 1 v3 hardstop:** end of 1 implementation session. Either
-  correctness PASS or scoped blocker (e.g., DPAS mad on int8 produces
-  unexpected acc behavior on Xe2).
-- **Phase 2 v3 hardstop:** end of 1 perf evaluation session. Either
-  W2 gate PASS or falsification report.
-- **Total budget:** 2-3 sessions wall-clock for v3 to reach W2 or
-  trigger v4 escalation.
+### 6.0 Phase 0.5 v3 throughput micro-bench (NEW HARDSTOP)
 
-If Phase 2 v3 falsifies (i.e., W2 fails despite Path A architectural
-fix), the next escalation is:
-- Path C (custom packing) via Phase 0 probe v4
-- OR hard pause + re-eval scope (decode-priority pivot, ternary
-  plateau on 8-10B vs 70B+ aspiration, etc.)
+Before committing 350-400 LOC of kernel implementation, validate
+the 8× headroom claim empirically on isolated DPAS calls:
+
+- **Deliverable:** `bench/probe_dpas_throughput.cpp` (~80 LOC, mirror
+  the structure of `bench/probe_dpas.cpp`). Times an isolated
+  `joint_matrix_mad<int8, int32>` at 8x16x32 vs an equivalent
+  `joint_matrix_mad<half, float>` at 16x16x16 over many iterations
+  (each MMA = 4096 ops, so wall-clock comparison is per-op-rate).
+- **Acceptance threshold:** INT8 DPAS shows ≥4× throughput vs FP16
+  joint_matrix on equivalent ops/s rate. The peak-spec ratio is
+  8×, but some wrapper overhead is expected; <4× indicates the
+  wrapper INT8 path is throttled or has hidden cost (mirroring the
+  Phase 2b vec loadA SLM alignment fragility).
+- **Hardstop semantics:**
+  - **PASS (≥4× throughput ratio):** Phase 1 v3 implementation
+    proceeds as scoped (§5 + §9).
+  - **FAIL (<4×):** Phase 1 v3 BLOCKED. Path A's structural
+    advantage relies on the throughput claim; if the wrapper
+    can't deliver, kernel work doesn't help. Escalate to v4
+    options (Path C, hard pause, decode-pivot scope re-eval).
+  - **MARGINAL (4-6× ratio):** Phase 1 v3 proceeds with
+    *reduced expected gain* on W2 gate. The 1.5× v0_BL gate
+    becomes harder to hit; document the reduced expectation in
+    the Phase 1 v3 commit message.
+
+This gate prevents the v2 trap (3 phases of work before
+falsification surfaces). If Path A's compute claim is wrong, we
+know in ~1 hour vs ~3 sessions.
+
+### 6.1 Phase 1 v3 hardstop
+
+End of 1 implementation session. Either:
+- **PASS:** correctness W1 gate (max_rel_err ≤ 1e-2 on 4 shapes).
+- **BLOCKER:** scoped issue (e.g., DPAS INT32 acc behavior on
+  Xe2 unexpected, per-chunk d fold precision loss, joint_matrix
+  INT8 wrapper crashes on actual workload despite probe pass).
+
+### 6.2 Phase 2 v3 hardstop
+
+End of 1 perf evaluation session. Either:
+- **PASS:** W2 gate ≥1.5× v0_BL on (16, 64, 14336) → ship + PR
+  llama.cpp upstream.
+- **FAIL:** falsification report `bench/v3_phase2_falsification.md`
+  (mirror v2 falsification doc structure) + escalation to v4.
+
+### 6.3 v4 escalation options (if Phase 0.5 or Phase 2 v3 falsifies)
+
+- Path C (custom packing) via Phase 0 probe v4.
+- Hard pause + re-eval scope (decode-priority pivot, ternary
+  plateau on 8-10B vs 70B+ aspiration, alternate hardware target).
+
+**Total budget:** ~2.5 sessions wall-clock for v3 to reach W2 or
+trigger v4 escalation:
+- Phase 0.5 throughput micro-bench: ~0.3 session (1-2 hours)
+- Phase 1 implementation + W1: ~1 session
+- Phase 2 perf eval + W2: ~1 session
+- Buffer: ~0.2 session for unforeseen fold-back from any phase
 
 ---
 
@@ -316,27 +504,46 @@ fix), the next escalation is:
 
 ## 9. LOC estimate & sequencing
 
-- `src/kernel_v3.h`: ~40 LOC (mirror kv2.h).
-- `src/kernel_v3.cpp`: ~350-400 LOC (includes the 5 sections
-  inline; the v2 Phase 2b file was ~500 LOC, v3 should be slightly
-  smaller because no FP16 dequant complexity).
+### Phase 0.5 v3 (NEW per §6.0 hardstop)
+
+- `bench/probe_dpas_throughput.cpp`: ~80 LOC. Mirror
+  `bench/probe_dpas.cpp` structure but timing-focused: many MMA
+  iterations + SYCL events, INT8 ratio vs FP16 baseline.
+- `bench/Makefile`: +2 LOC (target).
+
+### Phase 1 v3 (gated on Phase 0.5 PASS)
+
+- `src/kernel_v3.h`: ~40 LOC (mirror kv2.h structure; includes
+  `kernel_v0_sycl.hpp` for `sycl_queue_handle` per kv2 pattern,
+  per Sonnet-pragmatic review #X #7).
+- `src/kernel_v3.cpp`: ~400-450 LOC (5 sections inline; per-chunk
+  d fold pattern §4.2 adds ~30 LOC vs original estimate; activation
+  quant inline ~40 LOC).
 - `src/Makefile`: +2 LOC.
 - `bench/sweep_tile.cpp`: +50 LOC (kv3 variant pass).
-- **Total Phase 1 v3:** ~440-490 LOC across 4 files.
+- **Total Phase 1 v3:** ~490-540 LOC across 4 files.
 
-Sequencing:
-1. Throughput micro-bench (~1 hour wall-clock): validate 8×
-   headroom on isolated DPAS calls.
-2. Kernel skeleton (~2 hours): activation quant + dequant + MMA
-   + store, no perf optim, single shape (16, 16, 256) smoke pass.
-3. Multi-shape correctness W1 (~1 hour): all 4 W1 shapes
-   max_rel_err ≤ 1e-2.
-4. Phase 1 v3 commit + push.
-5. Phase 2 v3 profiler harness + W2 evaluation (separate session).
+### Sequencing
 
-LLM team timing realistic: Phase 1 v3 deliverable in ~1 session
-wall-clock alpha-side (or my equivalent if I keep coding solo per
-the current pattern).
+1. **Phase 0.5: throughput micro-bench** (~1 hour wall-clock). Acts
+   as hardstop per §6.0. Output: `bench/probe_dpas_throughput.{cpp,
+   csv,log}`.
+   **Hard gate**: if INT8/FP16 throughput ratio < 4×, STOP, escalate
+   to v4 per §6.3.
+2. **Phase 1 kernel skeleton** (~2 hours): single shape (16, 16, 256)
+   smoke pass. Activation quant inline + dequant + DPAS MMA + per-
+   chunk d fold + final store.
+3. **Multi-shape correctness W1** (~1 hour): all 4 W1 shapes
+   max_rel_err ≤ 1e-2. If activation quant + per-chunk d fold
+   exceeds 1e-2 budget, fall back to per-block group-quant scheme
+   (see §3.4 Phase 2 v3 deferred).
+4. **Phase 1 v3 commit + push** + 3-voice review (Sonnet code-quality
+   + Sonnet SYCL semantics + Opus strategic, mirror Phase 2b pattern).
+5. **Phase 2 v3 profiler harness + W2 evaluation** (separate session).
+
+LLM team timing realistic: Phase 0.5 + Phase 1 v3 deliverable in ~1
+session wall-clock alpha-side (or my equivalent if I keep coding
+solo per the current pattern). Phase 2 v3 in a 2nd session.
 
 ---
 
