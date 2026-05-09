@@ -1,0 +1,268 @@
+/*
+ * bench/probe_dpas_opencl.cpp -- Path A Phase 0 v4 hardstop gate.
+ *
+ * Per docs/design-v3.md sec6.0 + post-vote synthesis (commit 8388c37
+ * + 3-voice vote 2-1 for Option B with Phase 0 garde-fou).
+ *
+ * Tests if the `cl_intel_subgroup_matrix_multiply_accumulate` OpenCL
+ * extension (exposed by Arc B60 compute runtime per clinfo) actually
+ * delivers higher throughput than the SYCL `joint_matrix` wrapper
+ * which Phase 0.5 falsified at 1.0x FP16 throughput.
+ *
+ * Standalone OpenCL host program (no SYCL involvement) so we bypass
+ * the icpx 2025.3 SYCL header layer entirely. Uses OpenCL C API +
+ * Intel-specific kernel builtin `intel_sub_group_i8_i8_matrix_mad_k32`
+ * inside an OpenCL kernel string.
+ *
+ * Acceptance gate (per design v3 sec6.0 + Sonnet risk-reward fold):
+ *   PASS     : INT8 DPAS direct >= 2x SYCL wrapper FP16 baseline
+ *              (~93.6 GOps/s from probe_dpas_throughput.cpp run)
+ *              -> Path B unlocked, design v4 brief drafting starts.
+ *   MARGINAL : 1.5x to 2x -> proceed Path B with reduced expectations.
+ *   FAIL     : <1.5x or compile/link fail
+ *              -> Path B blocked, escalate v4 = D (ship as-is).
+ *
+ * Build: bench/Makefile target probe_dpas_opencl.
+ * Standalone, requires only libOpenCL.so + Arc B60 compute runtime.
+ */
+
+#define CL_TARGET_OPENCL_VERSION 300
+
+#include <CL/cl.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
+namespace {
+
+const char* g_kernel_src = R"CLC(
+// OpenCL 3.0 kernel using cl_intel_subgroup_matrix_multiply_accumulate.
+// Forces sub_group_size = 16 to match Arc B60 / Xe2 native DPAS.
+//
+// Builtin signature for SG=8 spec is:
+//   int8 intel_sub_group_i8_i8_matrix_mad_k32(int8 a, int8 b, int8 acc)
+// For SG=16, M=8, K=32, N=16, the per-lane storage redistributes; we
+// try the same canonical signature first and adjust if the compiler
+// rejects it.
+//
+// MMA op count per call: M*N*K*2 = 8*16*32*2 = 8192 ops (8x16x32 int8
+// matmul, 1 mul + 1 add per lane-position-step).
+
+__attribute__((intel_reqd_sub_group_size(16)))
+__kernel void dpas_int8_throughput(const int n_reps,
+                                   __global int* output)
+{
+    // Synthesize per-lane inputs. The values are deliberately small to
+    // keep the int32 accumulator from saturating across n_reps iters.
+    int8 a   = (int8)(1, 1, 1, 1, 1, 1, 1, 1);
+    int8 b   = (int8)(1, 1, 1, 1, 1, 1, 1, 1);
+    int8 acc = (int8)(0, 0, 0, 0, 0, 0, 0, 0);
+
+    // Repeat MMA n_reps times. acc accumulates; compiler cannot DCE.
+    for (int i = 0; i < n_reps; ++i) {
+        acc = intel_sub_group_i8_i8_matrix_mad_k32(a, b, acc);
+    }
+
+    // Write final acc so the loop result is observable.
+    const int gid = get_global_id(0);
+    output[gid] = acc.s0 + acc.s1 + acc.s2 + acc.s3
+                + acc.s4 + acc.s5 + acc.s6 + acc.s7;
+}
+)CLC";
+
+void check(cl_int err, const char* what) {
+    if (err != CL_SUCCESS) {
+        std::fprintf(stderr, "OpenCL error %d in %s\n", err, what);
+        std::exit(1);
+    }
+}
+
+cl_device_id find_arc_device() {
+    cl_uint n_platforms = 0;
+    check(clGetPlatformIDs(0, nullptr, &n_platforms), "clGetPlatformIDs(count)");
+    std::vector<cl_platform_id> platforms(n_platforms);
+    check(clGetPlatformIDs(n_platforms, platforms.data(), nullptr),
+          "clGetPlatformIDs");
+    for (cl_platform_id p : platforms) {
+        cl_uint n_devs = 0;
+        if (clGetDeviceIDs(p, CL_DEVICE_TYPE_GPU, 0, nullptr, &n_devs)
+                != CL_SUCCESS || n_devs == 0)
+            continue;
+        std::vector<cl_device_id> devs(n_devs);
+        clGetDeviceIDs(p, CL_DEVICE_TYPE_GPU, n_devs, devs.data(), nullptr);
+        for (cl_device_id d : devs) {
+            char name[256] = {};
+            clGetDeviceInfo(d, CL_DEVICE_NAME, sizeof(name), name, nullptr);
+            if (std::strstr(name, "Arc") != nullptr) {
+                return d;
+            }
+        }
+    }
+    std::fprintf(stderr, "no Intel Arc OpenCL device found\n");
+    std::exit(1);
+}
+
+bool device_has_extension(cl_device_id dev, const char* ext) {
+    std::size_t sz = 0;
+    clGetDeviceInfo(dev, CL_DEVICE_EXTENSIONS, 0, nullptr, &sz);
+    std::vector<char> buf(sz + 1, 0);
+    clGetDeviceInfo(dev, CL_DEVICE_EXTENSIONS, sz, buf.data(), nullptr);
+    return std::strstr(buf.data(), ext) != nullptr;
+}
+
+double event_ms(cl_event e) {
+    cl_ulong t0 = 0, t1 = 0;
+    clGetEventProfilingInfo(e, CL_PROFILING_COMMAND_START,
+                            sizeof(t0), &t0, nullptr);
+    clGetEventProfilingInfo(e, CL_PROFILING_COMMAND_END,
+                            sizeof(t1), &t1, nullptr);
+    return double(t1 - t0) / 1.0e6;  /* ns -> ms */
+}
+
+} /* anonymous namespace */
+
+int main() {
+    cl_device_id dev = find_arc_device();
+    char name[256] = {}, drv[256] = {};
+    clGetDeviceInfo(dev, CL_DEVICE_NAME, sizeof(name), name, nullptr);
+    clGetDeviceInfo(dev, CL_DRIVER_VERSION, sizeof(drv), drv, nullptr);
+    std::fprintf(stderr, "device: %s (driver: %s)\n", name, drv);
+
+    if (!device_has_extension(dev, "cl_intel_subgroup_matrix_multiply_accumulate")) {
+        std::fprintf(stderr,
+                     "FAIL: cl_intel_subgroup_matrix_multiply_accumulate "
+                     "not exposed by device extensions. Path B blocked.\n");
+        return 1;
+    }
+    std::fprintf(stderr,
+                 "OK: cl_intel_subgroup_matrix_multiply_accumulate exposed.\n");
+
+    cl_int err;
+    cl_context ctx = clCreateContext(nullptr, 1, &dev, nullptr, nullptr, &err);
+    check(err, "clCreateContext");
+
+    cl_command_queue_properties qprops[] =
+        {CL_QUEUE_PROPERTIES, CL_QUEUE_PROFILING_ENABLE, 0};
+    cl_command_queue q = clCreateCommandQueueWithProperties(
+        ctx, dev, qprops, &err);
+    check(err, "clCreateCommandQueueWithProperties");
+
+    cl_program prog = clCreateProgramWithSource(
+        ctx, 1, &g_kernel_src, nullptr, &err);
+    check(err, "clCreateProgramWithSource");
+
+    const char* build_opts =
+        "-cl-std=CL3.0 "
+        "-cl-mad-enable -cl-fast-relaxed-math";
+    err = clBuildProgram(prog, 1, &dev, build_opts, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        std::size_t log_sz = 0;
+        clGetProgramBuildInfo(prog, dev, CL_PROGRAM_BUILD_LOG,
+                              0, nullptr, &log_sz);
+        std::vector<char> log(log_sz + 1, 0);
+        clGetProgramBuildInfo(prog, dev, CL_PROGRAM_BUILD_LOG,
+                              log_sz, log.data(), nullptr);
+        std::fprintf(stderr, "BUILD FAIL:\n%s\n", log.data());
+        std::fprintf(stderr,
+                     "FAIL: kernel did not compile. The builtin signature "
+                     "may differ for SG=16 on this driver. Path B blocked "
+                     "until the correct signature is found.\n");
+        return 1;
+    }
+    std::fprintf(stderr, "OK: kernel compiled successfully.\n");
+
+    cl_kernel kern = clCreateKernel(prog, "dpas_int8_throughput", &err);
+    check(err, "clCreateKernel");
+
+    /* Output buffer: 1 int per lane, 16 lanes per WG, 1 WG = 16 ints. */
+    constexpr std::size_t NUM_LANES = 16;
+    cl_mem dout = clCreateBuffer(
+        ctx, CL_MEM_WRITE_ONLY,
+        NUM_LANES * sizeof(cl_int), nullptr, &err);
+    check(err, "clCreateBuffer");
+
+    auto run_one = [&](int n_reps) -> double {
+        check(clSetKernelArg(kern, 0, sizeof(int), &n_reps),
+              "clSetKernelArg(n_reps)");
+        check(clSetKernelArg(kern, 1, sizeof(cl_mem), &dout),
+              "clSetKernelArg(dout)");
+        std::size_t global = NUM_LANES, local = NUM_LANES;
+        cl_event evt;
+        check(clEnqueueNDRangeKernel(q, kern, 1, nullptr, &global, &local,
+                                     0, nullptr, &evt),
+              "clEnqueueNDRangeKernel");
+        check(clWaitForEvents(1, &evt), "clWaitForEvents");
+        const double ms = event_ms(evt);
+        clReleaseEvent(evt);
+        return ms;
+    };
+
+    std::vector<int> reps_list = {500, 1000, 2000, 5000};
+    constexpr unsigned warmups = 5, timed = 25;
+    constexpr double OPS_PER_MMA = 8.0 * 16.0 * 32.0 * 2.0;  /* 8192 */
+
+    std::printf("variant,N_REPS,t_ms_med,ops_per_mma,gops_per_s\n");
+
+    double med_at_2k = 0;
+    for (int n_reps : reps_list) {
+        for (unsigned w = 0; w < warmups; ++w) run_one(n_reps);
+        std::vector<double> ts;
+        ts.reserve(timed);
+        for (unsigned t = 0; t < timed; ++t) ts.push_back(run_one(n_reps));
+        std::sort(ts.begin(), ts.end());
+        const double med = ts[ts.size() / 2];
+        const double gops = (n_reps * OPS_PER_MMA) / (med * 1e6);
+        std::printf("dpas_opencl_int8_8x16x32,%d,%.5f,%.0f,%.2f\n",
+                    n_reps, med, OPS_PER_MMA, gops);
+        std::fprintf(stderr,
+                     "  N_REPS=%5d : INT8 DPAS direct t_med=%.4f ms (%.1f GOps/s)\n",
+                     n_reps, med, gops);
+        if (n_reps == 2000) med_at_2k = med;
+    }
+
+    clReleaseMemObject(dout);
+    clReleaseKernel(kern);
+    clReleaseProgram(prog);
+    clReleaseCommandQueue(q);
+    clReleaseContext(ctx);
+
+    /* Verdict gate per design v3 sec6.0 (revised post Phase 0.5).
+     * Baseline: probe_dpas_throughput.cpp commit 8388c37 measured FP16
+     * SYCL wrapper at ~93.6 GOps/s on N_REPS=2000 = ~0.0876 ms per
+     * 2000-rep kernel. We compare DPAS direct against this. */
+    constexpr double BASELINE_FP16_GOPS = 93.6;
+    if (med_at_2k <= 0.0) {
+        std::fprintf(stderr,
+                     "\nphase 0 v4 INVALID: missing 2000-rep timing.\n");
+        return 1;
+    }
+    const double gops_at_2k = (2000.0 * OPS_PER_MMA) / (med_at_2k * 1e6);
+    const double ratio = gops_at_2k / BASELINE_FP16_GOPS;
+    std::fprintf(stderr,
+                 "\nDPAS direct at N_REPS=2000: %.1f GOps/s\n"
+                 "FP16 wrapper baseline (commit 8388c37): %.1f GOps/s\n"
+                 "INT8 / FP16 throughput ratio: %.3fx\n",
+                 gops_at_2k, BASELINE_FP16_GOPS, ratio);
+    if (ratio >= 2.0) {
+        std::fprintf(stderr,
+                     "phase 0 v4 PASS: DPAS direct >= 2x FP16 wrapper "
+                     "(unlocks Path B). Design v4 brief drafting starts.\n");
+        return 0;
+    } else if (ratio >= 1.5) {
+        std::fprintf(stderr,
+                     "phase 0 v4 MARGINAL: 1.5x <= ratio < 2x. Path B "
+                     "may proceed but with reduced expectation on W2.\n");
+        return 0;
+    } else {
+        std::fprintf(stderr,
+                     "phase 0 v4 FAIL: ratio < 1.5x. DPAS direct does not "
+                     "deliver the structural speedup. Escalate v4 = D "
+                     "(ship as-is) per design v3 sec6.3.\n");
+        return 1;
+    }
+}

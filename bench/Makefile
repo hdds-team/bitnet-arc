@@ -80,6 +80,13 @@ probe_dpas: probe_dpas.cpp
 probe_dpas_throughput: probe_dpas_throughput.cpp
 	$(CXX_SYCL) $(SYCLFLAGS) $(INCLUDES) probe_dpas_throughput.cpp -o $@
 
+# Path A Phase 0 v4 hardstop: standalone OpenCL probe testing if
+# cl_intel_subgroup_matrix_multiply_accumulate (DPAS direct, bypass
+# SYCL joint_matrix wrapper) delivers >2x FP16 wrapper baseline.
+# Standalone, no SYCL toolchain involvement; just libOpenCL.so + IGC.
+probe_dpas_opencl: probe_dpas_opencl.cpp
+	$(CXX) $(CXXFLAGS) $(INCLUDES) probe_dpas_opencl.cpp -lOpenCL -o $@
+
 # Build dependent libraries on demand.
 $(ORACLE_LIB):
 	$(MAKE) -C ../oracle
