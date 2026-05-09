@@ -110,20 +110,25 @@ static inline std::uint16_t kv2_fp32_to_fp16(float f) {
  * template is kept generic for Phase 2 sweep extension; the
  * compile-time invariants below pin Phase 1's contract.
  *
- * SLM layout (per Phase 1 brief §5):
+ * SLM layout (per Phase 1 brief §5, post Phase 2b Lecture B switch):
  *   A_slab    : TILE_M  × K_CHUNK FP16  = 16 × 256 × 2 = 8 KB
  *   B_slab    : TILE_N  × K_CHUNK FP16  = 16 × 256 × 2 = 8 KB
- *   qs_local  : 64 bytes (TQ2_0 qs scratch for one block)
  *   ----                                  ~16 KB total
  * Well below Xe2's 64 KB / WG hard limit (port v1's static_assert).
+ * qs_local SLM scratch dropped in Lecture B (each lane reads its own
+ * block's qs[] directly from global into registers).
  *
- * NOTE on §3.1 lane mapping interpretation: this implementation
- * follows "Lecture A" (per chat-side clarification ping pre-coding):
- * the 16 lanes co-decode ONE TQ2_0 block per inner iteration, and
- * the kernel loops the §3.1 dance N_blocks_per_kchunk = TILE_N times
- * per K_CHUNK to fill all columns of B_slab. If the team confirms
- * "Lecture B" (lane = column, all parallel) I'll re-flip the inner
- * dequant; the surrounding kernel structure is unchanged either way.
+ * NOTE on §3.1 lane mapping interpretation: Phase 2b switches to
+ * "Lecture B" (lane = column, all parallel). Each lane owns one
+ * column n_local = lane and decodes all K_CHUNK K-positions for that
+ * column from its own block (qs[] read directly into registers, no
+ * SLM staging). Eliminates Lecture A's per-column loop (16 iters)
+ * and 32 sub-group barriers per K_CHUNK. The outer kernel structure
+ * (chunks_per_col loop, A SLM load, MMA, store) is unchanged.
+ *
+ * Phase 2a profiler bench/profile_v2_p2a.md identified §3.1 dequant
+ * as top-1 bottleneck (~55% of t_full); Lecture B is the §4.2 fix.
+ * Phase 2b §3.2 loadA vec-load is the §4.4 fix on top-2 (~37%).
  */
 
 template <unsigned TILE_M,
@@ -153,13 +158,11 @@ static void kv2_launch_impl(sycl_queue_handle& q_handle,
         static_cast<std::size_t>(TILE_M) * K_CHUNK * sizeof(std::uint16_t);
     constexpr std::size_t KV2_B_SLAB_BYTES =
         static_cast<std::size_t>(TILE_N) * K_CHUNK * sizeof(std::uint16_t);
-    constexpr std::size_t KV2_QS_BYTES = 64u; /* one TQ2_0 qs */
     constexpr std::size_t KV2_SLM_BUDGET_BYTES = 64u * 1024u;
-    static_assert(KV2_A_SLAB_BYTES + KV2_B_SLAB_BYTES + KV2_QS_BYTES
+    static_assert(KV2_A_SLAB_BYTES + KV2_B_SLAB_BYTES
                       <= KV2_SLM_BUDGET_BYTES,
-                  "kv2: A_slab + B_slab + qs scratch exceeds Xe2 64 KB "
-                  "SLM/WG hard limit -- pick smaller TILE_M, TILE_N, "
-                  "or K_CHUNK");
+                  "kv2: A_slab + B_slab exceeds Xe2 64 KB SLM/WG hard "
+                  "limit -- pick smaller TILE_M, TILE_N, or K_CHUNK");
 
     /* Host-side preconditions. */
     assert(M > 0 && "kv2: M must be > 0");
@@ -196,8 +199,10 @@ static void kv2_launch_impl(sycl_queue_handle& q_handle,
             sycl::range<1>(A_SLAB_ELEMS), h);
         sycl::local_accessor<std::uint16_t, 1> B_slab(
             sycl::range<1>(B_SLAB_ELEMS), h);
-        sycl::local_accessor<std::uint8_t, 1>  qs_local(
-            sycl::range<1>(KV2_QS_BYTES), h);
+        /* qs_local SLM scratch dropped in Phase 2b Lecture B switch:
+         * each lane reads its own block's qs[] from global into
+         * registers (compiler caches the 64-byte qs[] per block in
+         * the lane's register file across the inner k loop). */
 
         /* Launch geometry: 1 WG per output tile, 1 WG = 1 SG of
          * SG_SIZE lanes (per Phase 1 brief §4). */
@@ -230,80 +235,144 @@ static void kv2_launch_impl(sycl_queue_handle& q_handle,
 
                     /* --- §3.1 cooperative TQ2_0 -> FP16 dequant ---
                      *
-                     * Lecture A (default): loop over TILE_N columns,
-                     * each iteration cooperatively decodes ONE block
-                     * with the 16-lane stripe pattern from §3.1.c.
+                     * Lecture B (Phase 2b): each lane owns one column
+                     * n_local = lane and decodes all K_CHUNK positions
+                     * of its column from its own block's qs[] read
+                     * directly into registers (no SLM staging).
                      *
-                     * Outer-n loop runs TILE_N times per K_CHUNK
-                     * iteration. If clarification swings to Lecture B,
-                     * this nest collapses to a single per-lane pass.
+                     * MEMORY-PATTERN CAVEAT (per Phase 2b review #X
+                     * sonnet-SYCL-semantics nit): the per-lane qs read
+                     * pattern strides through B_blocks at
+                     * `blocks_per_col * sizeof(block) = 4480 bytes`
+                     * between lanes for K=14336. This is fully strided
+                     * (16 cache-line misses per dequant-step) vs
+                     * Lecture A's coalesced 64-byte cooperative load.
+                     * The barrier savings (32 -> 0 per chunk) are
+                     * traded against GDDR6 bandwidth pressure -- net
+                     * 1.44x speedup observed but bounded by the
+                     * memory regression. If a Phase 3 sweep ever
+                     * needs more dequant speedup, consider hybrid
+                     * (cooperative qs load + per-lane decode) or
+                     * Path A (INT8 DPAS, no FP16 materialization).
+                     *
+                     * Inner outer loop over `n_local += SG_SIZE` makes
+                     * this work for TILE_N > SG_SIZE (Phase 2+ sweep);
+                     * for Phase 1's TILE_N = SG_SIZE = 16 it runs once.
+                     * Inner outer loop over BLOCKS_PER_CHUNK handles
+                     * K_CHUNK > 256 (multiple blocks per chunk per
+                     * column); for K_CHUNK = 256 it runs once.
+                     *
+                     * Eliminates Lecture A's TILE_N inner iterations
+                     * + 2 sub-group barriers per iteration = 32
+                     * barriers per chunk. The SLM qs_local scratch is
+                     * no longer needed; the compiler caches the
+                     * 64-byte qs[] per block in the lane register
+                     * file across the inner k loop.
                      */
-                    for (unsigned n_local = 0; n_local < TILE_N; ++n_local) {
-                        const std::size_t blk_idx =
-                            (n_group + n_local) * blocks_per_col + k_chunk0;
-                        const bitnet_arc_tq2_0_block& blk = B_blocks[blk_idx];
+                    for (unsigned n_local = lane;
+                         n_local < TILE_N;
+                         n_local += SG_SIZE)
+                    {
+                        for (unsigned blk_in_chunk = 0;
+                             blk_in_chunk < BLOCKS_PER_CHUNK;
+                             ++blk_in_chunk)
+                        {
+                            const std::size_t blk_idx =
+                                (n_group + n_local) * blocks_per_col
+                                + k_chunk0 + blk_in_chunk;
+                            const bitnet_arc_tq2_0_block& blk =
+                                B_blocks[blk_idx];
+                            const float d_f = kv2_fp16_to_fp32(blk.d);
+                            const unsigned k_base = blk_in_chunk * 256u;
 
-                        /* (a) Coalesced qs byte-stripe load: lane i
-                         *     copies bytes [i*4 .. i*4+3] into
-                         *     qs_local. */
-                        for (unsigned b = 0; b < 4u; ++b) {
-                            qs_local[lane * 4u + b] = blk.qs[lane * 4u + b];
+                            for (unsigned k_in_blk = 0;
+                                 k_in_blk < 256u;
+                                 ++k_in_blk)
+                            {
+                                const std::size_t byte =
+                                    static_cast<std::size_t>(
+                                        (k_in_blk >> 7) * 32u
+                                        + (k_in_blk & 31u));
+                                const unsigned shift =
+                                    static_cast<unsigned>(
+                                        ((k_in_blk >> 5) & 3u) * 2u);
+                                const std::uint8_t code =
+                                    (blk.qs[byte] >> shift) & 0x3u;
+                                const int s = static_cast<int>(code) - 1;
+                                const float w =
+                                    static_cast<float>(s) * d_f;
+                                B_slab[static_cast<std::size_t>(
+                                           k_base + k_in_blk)
+                                       * TILE_N + n_local] =
+                                    kv2_fp32_to_fp16(w);
+                            }
                         }
-                        /* d (FP16): all lanes read the same `blk.d`
-                         * from global, so they all end up with the
-                         * same value -- no group_broadcast needed
-                         * (per @beta review #77 minor). */
-                        const float d_f = kv2_fp16_to_fp32(blk.d);
-
-                        /* (b) sub-group barrier: qs_local must be
-                         *     settled before decode reads from it. */
-                        sycl::group_barrier(sg);
-
-                        /* (c) Decode: lane i emits 16 codes for
-                         *     K-positions [i*16 .. i*16+15] of this
-                         *     column n_local, scaled by d, into
-                         *     B_slab[k * TILE_N + n_local].
-                         *
-                         *     B_slab layout: (K, N) row-major --
-                         *     element (k, n) at offset k*TILE_N + n.
-                         *     This matches joint_matrix_load with
-                         *     use::b row_major which expects K rows
-                         *     × N cols at stride TILE_N. */
-                        for (unsigned k_off = 0; k_off < FRAG_K; ++k_off) {
-                            const unsigned k = lane * FRAG_K + k_off;
-                            const std::size_t byte =
-                                static_cast<std::size_t>((k >> 7) * 32u
-                                                         + (k & 31u));
-                            const unsigned shift =
-                                static_cast<unsigned>(((k >> 5) & 3u) * 2u);
-                            const std::uint8_t code =
-                                (qs_local[byte] >> shift) & 0x3u;
-                            const int s = static_cast<int>(code) - 1;
-                            const float w = static_cast<float>(s) * d_f;
-                            B_slab[static_cast<std::size_t>(k) * TILE_N
-                                   + n_local] = kv2_fp32_to_fp16(w);
-                        }
-
-                        /* sub-group barrier between columns: B_slab
-                         * column n_local must be settled before the
-                         * next column overwrites qs_local. */
-                        sycl::group_barrier(sg);
                     }
 
-                    /* --- §3.2 cooperative A SLM load --- *
+                    /* --- §3.2 cooperative A SLM load (Phase 2b) --- *
                      *
-                     * lid-strided coalesced copy of M=TILE_M rows of
-                     * K_CHUNK FP16 elements each. Each lane reads
-                     * (A_SLAB_ELEMS / SG_SIZE) entries.
+                     * Vectorized lid-strided copy: each lane issues
+                     * sycl::vec<half, VEC_W> wide loads from global
+                     * to SLM, reducing LSU pipeline ops by VEC_W vs
+                     * the scalar Phase 1 loop. Same coalescing
+                     * pattern (16 lanes × VEC_W = 128 half = 256
+                     * bytes per SG-wide step), within Arc B60 GDDR6
+                     * cache-line size.
+                     *
+                     * Alignment guarantees: A_fp16 is sycl::malloc_
+                     * device-aligned (>= 16-byte); offset
+                     * (m_group+m_idx)*K + k0 + k_off is a multiple
+                     * of VEC_W as long as K, K_CHUNK, and lane*VEC_W
+                     * are all VEC_W-aligned. K is constrained by the
+                     * outer assert (K % 256 == 0 and VEC_W=8 divides
+                     * 256).
+                     *
+                     * SLM ALIGNMENT CAVEAT (per Phase 2b review #X
+                     * sonnet-SYCL-semantics nit): SYCL2020 spec only
+                     * guarantees `local_accessor<uint16_t>` is
+                     * aligned to alignof(uint16_t) = 2 bytes.
+                     * vec<half,8> requires 16-byte alignment.
+                     * In practice icpx 2025.3 places SLM accessors
+                     * on >=128-byte boundaries on Xe2 (verified by
+                     * observed perf gain), but this is implementation
+                     * behavior, not spec guarantee. If icpx changes
+                     * the alignment policy, vec writes here may fall
+                     * back to scalar silently. Path A pivot would
+                     * eliminate this fragility.
+                     *
+                     * STRICT-ALIASING CAVEAT (same review): the
+                     * reinterpret_cast<vec_half_t*> on uint16_t
+                     * storage is type-punning and would be UB in
+                     * standard C++. icpx kernel codegen is built
+                     * with -fno-strict-aliasing equivalent for SPIR-V
+                     * lowering, so this is safe under icpx. Other
+                     * SYCL toolchains would need
+                     * sycl::vec<half,8>::load() canonical pattern.
                      */
-                    for (std::size_t idx = lane;
-                         idx < A_SLAB_ELEMS;
-                         idx += SG_SIZE)
+                    constexpr unsigned VEC_W = 8u;
+                    static_assert(K_CHUNK % VEC_W == 0u,
+                                  "Phase 2b vec loadA: K_CHUNK must be "
+                                  "multiple of VEC_W=8");
+                    static_assert((TILE_M * K_CHUNK) % (VEC_W * SG_SIZE) == 0u,
+                                  "Phase 2b vec loadA: A_SLAB_ELEMS must "
+                                  "be multiple of VEC_W * SG_SIZE");
+                    using vec_half_t = sycl::vec<sycl::half, VEC_W>;
+                    constexpr std::size_t A_SLAB_VEC_ELEMS =
+                        A_SLAB_ELEMS / VEC_W;
+                    for (std::size_t vidx = lane;
+                         vidx < A_SLAB_VEC_ELEMS;
+                         vidx += SG_SIZE)
                     {
+                        const std::size_t idx = vidx * VEC_W;
                         const std::size_t m_idx = idx / K_CHUNK;
                         const std::size_t k_off = idx % K_CHUNK;
-                        A_slab[idx] = A_fp16[(m_group + m_idx) * K
-                                             + k0 + k_off];
+                        const auto* src =
+                            reinterpret_cast<const vec_half_t*>(
+                                &A_fp16[(m_group + m_idx) * K
+                                        + k0 + k_off]);
+                        auto* dst =
+                            reinterpret_cast<vec_half_t*>(&A_slab[idx]);
+                        *dst = *src;
                     }
 
                     /* sub-group barrier: A_slab + B_slab must be
