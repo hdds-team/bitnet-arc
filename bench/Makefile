@@ -94,6 +94,17 @@ probe_dpas_opencl: probe_dpas_opencl.cpp
 probe_dpas_int4_throughput: probe_dpas_int4_throughput.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) probe_dpas_int4_throughput.cpp -lOpenCL -o $@
 
+# Path 8 minimal probe: cl_intel_subgroup_2d_block_io vs scalar reads.
+# 8x32 byte block (matches typical A_slab tile in kv4 ternary).
+probe_2d_block_io: probe_2d_block_io.cpp
+	$(CXX) $(CXXFLAGS) $(INCLUDES) probe_2d_block_io.cpp -lOpenCL -o $@
+
+# Path 9 ESIMD probe: sycl::ext::intel::esimd::xmx::dpas with s2 (INT2)
+# precision -- the only path to the silicon-native INT2 DPAS on Xe2
+# (not exposed via OpenCL builtin nor SYCL joint_matrix on icpx 2025.3).
+probe_esimd_int2: probe_esimd_int2.cpp
+	$(CXX_SYCL) $(SYCLFLAGS) $(INCLUDES) probe_esimd_int2.cpp -o $@
+
 # Build dependent libraries on demand.
 $(ORACLE_LIB):
 	$(MAKE) -C ../oracle

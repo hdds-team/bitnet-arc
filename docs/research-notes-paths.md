@@ -114,17 +114,78 @@ be the only paths to access it (= Path 9 territory).
 For ternary specifically, INT4 K=64 (Path 6, 2.6× FP16, validated)
 is the practical near-native option since INT2 builtin doesn't exist.
 
-### Path 8 — `cl_intel_subgroup_2d_block_io` for memory throughput
+### Path 8 — `cl_intel_subgroup_2d_block_io` ❌ MODEST (on 8x32 tile)
 
-- Block reads/writes specialized for matmul (transpose + transform
-  pre-processing).
-- Pairs with DPAS in standard GEMM patterns.
-- Could address the loadA top-2 bottleneck (~37% of kv2 t_full).
-- Not a compute speedup but a memory throughput optim.
-- Combined with Path 6 INT4: kernel could be both compute-fast AND
-  memory-efficient.
+**Tested via `bench/probe_2d_block_io.cpp` 2026-05-09** with 8r32x1c
+(8 rows × 32 cols × 1 byte = 256 bytes per call).
 
-### Path 9 — Inline asm DPAS (intel/sycl-tla pattern)
+Result: **block IO is ~4× SLOWER than scalar coalesced reads** on
+this shape (2.7 GB/s vs 10.1 GB/s, ratio 0.247×).
+
+Likely explanation: 8x32 = 256 bytes is too small to amortize the
+block read setup overhead (coord computation, pitch handling). The
+scalar pattern (16 lanes × uint reads = 64-byte coalesced load,
+compiler-optimized) wins on small tiles.
+
+**Verdict for kv4 ternary on this shape**: not worth integrating.
+Worth retesting on larger tiles (16r or 32r variants) which may
+amortize better. Defer to Phase 2/3 v4 optim if ever needed.
+
+The 2D block IO extension itself works (compiles, runs) — just not
+beneficial for our small-tile size workload at first measurement.
+
+### Path 9 — ESIMD `xmx::dpas` (Intel SYCL extension, NOT inline asm) ✅ PASS (3.76× FP16) ⭐ CHAMPION
+
+**@naskel pointed to ESIMD as the path. It paid off enormously.**
+
+`sycl::ext::intel::esimd::xmx::dpas<>` is a templated function in icpx
+2025.3 that exposes the Xe2 DPAS instruction with **all the precision
+types** including the silicon-native ones. Located at
+`/opt/intel/oneapi/compiler/2025.3/include/sycl/ext/intel/esimd/xmx/`.
+
+The `dpas_argument_type` enum (`common.hpp`) lists:
+```c
+u2 = 3,    // unsigned 2 bits
+s2 = 4,    // signed 2 bits  ← TERNARY {-1, 0, +1} fit PARFAIT
+u4, s4, s8, bf16, tf32, ...
+```
+
+**INT2 (s2) IS exposed via ESIMD**, even though it's NOT in the
+OpenCL `cl_intel_subgroup_matrix_multiply_accumulate` extension or
+SYCL `joint_matrix` / `precision::*` types. ESIMD is the documented
+Intel-specific path to this silicon feature.
+
+**Empirical result (validated, `bench/probe_esimd_int2.cpp`)**:
+- INT2 (s2) × INT2 (s2) → INT32 acc, M=8, K=64, N=16 (Xe2 ExecSize=16)
+- N_REPS=2000: **351.6 GOps/s** (= 46.6 ns/MMA, 16384 ops/MMA)
+- N_REPS=5000: **367.6 GOps/s** (asymptotic)
+- VALIDATED: output = 8192 × 50 = 409600 exact
+
+**Ratios:**
+- vs FP16 SYCL wrapper baseline (93.6 GOps/s): **3.76×** STRONG PASS
+- vs INT4 K=64 OpenCL builtin (244.2 GOps/s): **1.44×** (ESIMD path
+  is empirically faster than OpenCL builtin path even at same ops/MMA;
+  likely due to single-thread SIMD16 vs SG-cooperative overhead)
+- vs theoretical Intel "8× INT8 peak" claim: **3.76× achieved** (~47%
+  of theoretical peak — best we've seen on this hardware/toolchain)
+
+**Per-MMA wall-clock by precision (Arc B60, validated)**:
+| Path | ns/MMA | ops/MMA | GOps/s |
+|------|-------:|--------:|-------:|
+| FP16 SYCL wrapper (16x16x16) | 43 | 4096 | 93.6 |
+| INT8 OpenCL builtin (8x16x32) | 67 | 8192 | 122.1 |
+| INT4 OpenCL builtin (8x16x64) | 67 | 16384 | 244.2 |
+| **ESIMD INT2 (8x16x64)** | **47** | **16384** | **351.6** |
+
+**Trade-off vs INT4 path**: ESIMD requires a different programming
+model than SYCL classic (single-thread SIMD instead of SG-cooperative
+nd_range). Phase 1 v4 implementation effort is +0.5-1 session vs
+INT4 path. The 1.44× extra speedup vs INT4 OpenCL is worth the
+complexity for the headline shape kv4 perf.
+
+**Storage match for ternary**: INT2 signed `{00=0, 01=1, 11=-1}` —
+ternary fits exactly, no storage waste. INT4 wastes 50% of B-matrix
+bits per ternary code.
 
 - intel/sycl-tla `include/cute/arch/mma_xe.hpp` uses inline asm
   Xe2 instructions: `"dpas. #TB . #TA .8.%3 (M1, 16) DST.0 ..."`
