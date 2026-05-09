@@ -124,9 +124,42 @@ void pack_tq2_0_blocks(const std::vector<int8_t>& ternary_KxN,
     }
 }
 
+/* RAII guard for USM device allocations. Scope-exit calls
+ * sycl::free, so an exception in the kernel path (e.g.
+ * q.wait_and_throw on a device error) cannot leak the 3 USM
+ * buffers per shape iteration. Per @beta review #83 fold (~10 LOC,
+ * no extra dep, no try/catch around the shape loop). */
+template<typename T>
+struct usm_device_uptr {
+    T*           ptr{nullptr};
+    sycl::queue* q  {nullptr};
+    usm_device_uptr() = default;
+    usm_device_uptr(std::size_t n, sycl::queue& queue)
+        : ptr(sycl::malloc_device<T>(n, queue)), q(&queue) {}
+    ~usm_device_uptr() { if (ptr && q) sycl::free(ptr, *q); }
+    usm_device_uptr(const usm_device_uptr&)            = delete;
+    usm_device_uptr& operator=(const usm_device_uptr&) = delete;
+    usm_device_uptr(usm_device_uptr&& o) noexcept
+        : ptr(o.ptr), q(o.q) { o.ptr = nullptr; o.q = nullptr; }
+    usm_device_uptr& operator=(usm_device_uptr&& o) noexcept {
+        if (this != &o) {
+            if (ptr && q) sycl::free(ptr, *q);
+            ptr = o.ptr; q = o.q;
+            o.ptr = nullptr; o.q = nullptr;
+        }
+        return *this;
+    }
+    T* get() const noexcept { return ptr; }
+};
+
 struct stats_t { double t_min, t_med, t_mean, t_std, t_p99; };
 
 stats_t summarize(std::vector<double> ts) {
+    /* Defensive : empty input would UB on ts.front() and underflow on
+     * (n - 1) -> SIZE_MAX -> OOB read. Caught by @beta + @theta on
+     * review #83 (fold). The CLI validation (`--timed > 0`) is the
+     * primary guard; this is the belt-and-braces fallback. */
+    if (ts.empty()) return {};
     std::sort(ts.begin(), ts.end());
     const std::size_t n = ts.size();
     stats_t s{};
@@ -230,11 +263,45 @@ int main(int argc, char** argv) {
     std::uint32_t seed = 1337;
     bool split_build = false; /* (b) section-split mode flag */
 
+    /* Parse a positive-integer CLI value. Returns false (and prints
+     * an error) on empty / non-numeric / non-positive input -- this
+     * blocks the misfires caught by @beta + @theta on review #83 :
+     * `--timed 0` would crash summarize(); `--warmup -1` would wrap
+     * to UINT_MAX and burn the GPU for ~4e9 iterations. */
+    auto parse_pos_uint = [](const char* s, const char* name,
+                             unsigned& dst) -> bool {
+        char* end = nullptr;
+        const long v = std::strtol(s, &end, 10);
+        if (end == s || end == nullptr || *end != '\0' || v <= 0) {
+            std::fprintf(stderr,
+                "error: %s requires a positive integer (got '%s')\n",
+                name, s);
+            return false;
+        }
+        dst = static_cast<unsigned>(v);
+        return true;
+    };
+
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
-        if      (a == "--warmup" && i + 1 < argc) warmup = std::atoi(argv[++i]);
-        else if (a == "--timed"  && i + 1 < argc) timed  = std::atoi(argv[++i]);
-        else if (a == "--seed"   && i + 1 < argc) seed   = std::atoi(argv[++i]);
+        if      (a == "--warmup" && i + 1 < argc) {
+            if (!parse_pos_uint(argv[++i], "--warmup", warmup)) return 1;
+        }
+        else if (a == "--timed"  && i + 1 < argc) {
+            if (!parse_pos_uint(argv[++i], "--timed",  timed))  return 1;
+        }
+        else if (a == "--seed"   && i + 1 < argc) {
+            /* Seed accepts any uint32 incl. 0 ; non-numeric is the
+             * only error path (no positivity constraint). */
+            char* end = nullptr;
+            const long v = std::strtol(argv[++i], &end, 10);
+            if (end == argv[i] || *end != '\0' || v < 0) {
+                std::fprintf(stderr,
+                    "error: --seed requires a non-negative integer\n");
+                return 1;
+            }
+            seed = static_cast<std::uint32_t>(v);
+        }
         else if (a == "--split-build")            split_build = true;
         else if (a == "--help") {
             std::printf(
@@ -282,15 +349,19 @@ int main(int argc, char** argv) {
         std::vector<bitnet_arc_tq2_0_block> B;
         pack_tq2_0_blocks(tern, s.K, s.N, B);
 
-        auto* A_d = sycl::malloc_device<uint16_t>(s.M * s.K, q);
-        auto* B_d = sycl::malloc_device<bitnet_arc_tq2_0_block>(B.size(), q);
-        auto* C_d = sycl::malloc_device<uint16_t>(s.M * s.N, q);
-        q.memcpy(A_d, A.data(), s.M * s.K * sizeof(uint16_t)).wait();
-        q.memcpy(B_d, B.data(), B.size() * sizeof(B[0])).wait();
+        /* USM device allocations via RAII guard (review #83 fold) :
+         * scope-exit frees automatically, so a SYCL exception in the
+         * kernel path can no longer leak the buffers. */
+        usm_device_uptr<uint16_t>                  A_d(s.M * s.K, q);
+        usm_device_uptr<bitnet_arc_tq2_0_block>    B_d(B.size(),  q);
+        usm_device_uptr<uint16_t>                  C_d(s.M * s.N, q);
+        q.memcpy(A_d.get(), A.data(), s.M * s.K * sizeof(uint16_t)).wait();
+        q.memcpy(B_d.get(), B.data(), B.size() * sizeof(B[0])).wait();
 
         /* --- build (a) FULL ------------------------------------------ */
         const stats_t full = time_full_v2(q, qh, s.M, s.N, s.K,
-                                          A_d, B_d, C_d, warmup, timed);
+                                          A_d.get(), B_d.get(), C_d.get(),
+                                          warmup, timed);
         const double bytes = bytes_for(s.M, s.N, s.K);
         const double gbs   = (bytes / 1e9) / (full.t_med / 1e3);
         const occupancy_t occ = probe_occupancy(q, s.M, s.N, s.K);
@@ -338,9 +409,7 @@ int main(int argc, char** argv) {
                 s.tag);
         }
 
-        sycl::free(A_d, q);
-        sycl::free(B_d, q);
-        sycl::free(C_d, q);
+        /* A_d / B_d / C_d auto-freed at scope exit (RAII). */
     }
 
     /* --- summary + bottleneck call (per brief sec4.5) ---------------- */
