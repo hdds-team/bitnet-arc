@@ -17,12 +17,29 @@ The hardware data from task #155 (`bench/profile_v0_bl.md`, commit
 kernel v1 (SLM tiling) was falsified at +3 %.
 
 v0_BL on (M=64, N=64, K=14336) is **compute-bound**: HBM at 0.19 % of
-peak (524x under-saturated), and **60x off scalar peak treating each
-ternary contribution as one op** (58.7 M ops / 1.5 TFLOPS = 39 µs floor
-vs 2.4 ms measured -- per `bench/profile_v0_bl.md` §3, commit
-`8631ac9`). Counted as MAC = 2 FLOPs, the gap is 30x; either framing
-keeps the diagnosis. The 1-WI-per-output scalar inner loop wastes the
-ALU.
+peak (524x under-saturated), and **~250x off scalar FP32 peak**
+(117.5 M FLOPs / 12.28 TFLOPS = 9.6 µs floor vs 2.4 ms measured --
+per `bench/profile_v0_bl.md` §3, post-fix commit). The 1-WI-per-
+output scalar inner loop wastes the ALU.
+
+The 12.28 TFLOPS FP32 figure is from Intel's official Arc Pro B60
+spec sheet[^arcb60]. An earlier draft of this brief (and of the
+profile report) cited 1.5 TFLOPS, giving ~60x; that figure was
+unsourced and stale. The corrected ~250x gap strengthens the
+compute-bound diagnosis -- the brute compute headroom is ~8x larger
+than first reported.
+
+[^arcb60]: Intel Arc Pro B60 Graphics specifications: 20 Xe2 cores @
+2400 MHz boost, 160 XMX engines, 12.28 TFLOPS FP32, 197 TOPS INT8
+via XMX, 24 GB GDDR6 192-bit @ 19 Gbps = 456 GB/s. See
+https://www.intel.com/content/www/us/en/products/sku/243916/
+intel-arc-pro-b60-graphics/specifications.html (cross-referenced
+via WebSearch; Intel official page returns 403 to direct
+WebFetch, third-party DBs SiliconCat / CpuTronic / gpupoet / HMC
+agree on these numbers). FP16 vector peak ~24.58 TFLOPS by the
+2:1 Xe2 ratio is third-party-derived, not Intel-official; XMX
+FP16 peak is a separate higher figure that Phase 0 will pin
+empirically.
 
 This document proposes **kernel v2 = XMX (matrix-engine) path**, with
 ternary weights dequantized to FP16 in SLM and `sycl::ext::oneapi::
@@ -63,19 +80,24 @@ The compute-bound diagnosis means the bottleneck is **ALU
 throughput**, not memory traffic. XMX (Intel's per-Xe-core matrix
 engine on Xe2) issues one matrix-multiply-accumulate (MMA) per cycle
 per sub-group, replacing N scalar FMAs in the K-walk reduction with a
-single matrix-fragment op. This is precisely the redundancy the
-profile shows v0_BL wasting.
+single matrix-fragment op. B60 has 160 XMX engines spread across 20
+Xe2 cores -- precisely the silicon v0_BL leaves idle.
 
-Order-of-magnitude estimate on (64, 64, 14336) with FP16 joint_matrix
-(M=8, N=16, K=16 fragment, ratios from PVC; verify on B60 in Phase 0):
+Order-of-magnitude estimate on (64, 64, 14336) with an FP16
+joint_matrix at fragment size 8x16x16 (PVC reference; B60 fragment
+shapes are pinned in Phase 0):
 
 - Per-output FMAs in v0_BL: 14336 (sequential scalar reduction).
 - Per-output MMAs in v2: 14336 / 16 = **896 fragment ops**, each one
   doing 8x16 MACs in parallel via XMX.
-- Effective ALU work compressed by 16x at the inner-loop level.
-- 5-10x end-to-end speedup target accounts for: fragment-loading
-  overhead, ternary-to-FP16 dequant in SLM, sub-group sync, residual
-  per-tile sequential code.
+- Effective K-dim compression of ALU work: ~16x at the inner-loop
+  level, amortized further across the output tile.
+- **Realistic v2 target on this shape: 5-15x end-to-end speedup vs
+  v0_BL.** That accounts for fragment-loading overhead, ternary-to-
+  FP16 dequant in SLM, sub-group sync, residual per-tile sequential
+  code. The 250x brute compute margin gives ~17x headroom above a
+  15x target -- room to absorb implementation friction without
+  busting the gate.
 
 ### 2.2 Why FP16 joint_matrix and not INT8 DPAS
 
@@ -257,8 +279,11 @@ expected lift:
 - **W1 (correctness):** max_rel_err <= 1e-2, over_threshold == 0 on
   all W1.5 LLM preset shapes (`oracle/tolerance.h::
   BITNET_ARC_TOL_SYCL_VS_FP32REF`).
-- **W2 (speedup):** best v2 / best v0_BL >= 1.5x at (64, 64, 14336).
-  Stretch: 5x. Aspirational: 10x.
+- **W2 (speedup):** best v2 / best v0_BL >= 1.5x at (64, 64, 14336)
+  -- regression floor, structural. Realistic target **5-15x**.
+  Upper-bound stretch **50x** (still ~5x below the brute compute
+  ceiling, leaves room for follow-up Phase A escalation if data
+  warrants).
 - **W3 (utilization, soft):** sustained HBM bandwidth >= 5 GB/s on
   (64, 64, 14336) -- 1 % peak. Compute-bound regime means this is a
   side-effect, not a target. Still useful as a regression marker.
@@ -286,9 +311,11 @@ A. ~~Should Phase 0 probe also test BF16 fragments?~~ **Resolved
 
 B. **Pre-dequantize once, store FP16 weights persistently?** Bypasses
    the dequant cost entirely at the price of 8x weight storage (8B
-   model -> ~16 GB FP16 weights, fits in B60's 24 GB headroom --
-   verify against an actual model load before committing budget).
-   Worth measuring as the Path-B-pure-compute upper bound.
+   model -> ~16 GB FP16 weights). B60 ships with 24 GB GDDR6
+   (Intel-official), so the headroom is real but tight once KV cache
+   and intermediate activations are sized in. Verify against an
+   actual model load before committing budget. Worth measuring as
+   the Path-B-pure-compute upper bound.
 
 C. **(64, 64, 14336) is the FFN shape. Prefill (M=64-256+) variant
    family scope.** Pinned post-review #73 (@haiku):

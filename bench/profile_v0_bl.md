@@ -47,15 +47,31 @@ to deliver those bytes. There is **no contention on memory**.
 
 This rules out **memory-bound** conclusively.
 
-### Compute sanity check — 60× off scalar peak
+### Compute sanity check — ~250× off scalar peak
 
 At K = 14336:
 
 - Total MAC count (output-element view): M × N × K = 64 × 64 × 14336 ≈
-  58.7 M ternary FMAs (treating each ternary contribution as one op).
-- Arc B60 theoretical FP32 scalar peak: ~1.5 TFLOPS.
-- Compute-only floor: 58.7M / 1.5T ≈ **39 µs**.
-- Measured: 2.402 ms = **~60× off the scalar peak**.
+  58.7 M FMAs = **117.5 M FLOPs** (1 FMA = 2 FLOPs, the v0_BL inner
+  loop is genuinely a scalar FP32 multiply + add per element).
+- **Arc B60 FP32 scalar peak: 12.28 TFLOPS** (Intel official spec[^1],
+  20 Xe2 cores × 2400 MHz boost). FP16 vector peak ~24.58 TFLOPS
+  (2:1 ratio per Xe2 architecture docs; not an XMX number). XMX FP16
+  peak is separate and remains to pin in Phase 0 of design v2.
+- Compute-only floor: 117.5M / 12.28T ≈ **9.6 µs**.
+- Measured: 2.402 ms = **~250× off the scalar peak**.
+
+[^1]: https://www.intel.com/content/www/us/en/products/sku/243916/
+intel-arc-pro-b60-graphics/specifications.html (cross-referenced via
+WebSearch summary; Intel official page returns 403 to direct fetch
+but is cited by third-party DBs SiliconCat / CpuTronic and the
+ASRock B60 Passive product page).
+
+(An earlier draft of this report cited 1.5 TFLOPS as the FP32 peak,
+giving a ~60× gap. The 1.5 TFLOPS number was unsourced and almost
+certainly stale (looks like a guess from an earlier Arc generation).
+The corrected ~250× gap *strengthens* the COMPUTE-BOUND verdict --
+there is even more ALU headroom than originally claimed.)
 
 The v0 kernel runs 1 work-item per output element with a serial inner
 K-walk. Each work-item issues scalar FMAs only. SIMD lanes inside each
