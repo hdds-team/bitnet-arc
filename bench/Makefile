@@ -44,6 +44,14 @@ profile_v0_bl: profile_v0_bl.cpp $(KERNEL_LIB) $(ORACLE_LIB) $(HEADERS) $(KERNEL
 	$(CXX_SYCL) $(SYCLFLAGS) $(INCLUDES) profile_v0_bl.cpp \
 	    $(KERNEL_LIB) $(ORACLE_LIB) -o $@
 
+# Task #160 / design v2 Phase 2a -- kernel_v2 section profiler.
+# Phase 2a step 1: build (a) FULL only. Step 2 = --split-build adds
+# per-section ratios via section-split kernel skeleton. See
+# bench/profile_v2.cpp header + docs/design-v2-phase-2.md sec3.
+profile_v2: profile_v2.cpp $(KERNEL_LIB) $(ORACLE_LIB) $(HEADERS) ../src/kernel_v2.h
+	$(CXX_SYCL) $(SYCLFLAGS) $(INCLUDES) profile_v2.cpp \
+	    $(KERNEL_LIB) $(ORACLE_LIB) -o $@
+
 # Task #156 / design v2 Phase 0 -- joint_matrix availability probe.
 # Standalone (no kernel_v0 lib needed): only links libc++ + the oracle
 # fp16 helpers via header. Same icpx toolchain.
@@ -81,6 +89,6 @@ gate-strict:
 	python3 gate_w1w2.py --strict-gates $(GATE_CSV)
 
 clean:
-	rm -f harness_3way sweep_tile profile_v0_bl probe_joint_matrix
+	rm -f harness_3way sweep_tile profile_v0_bl profile_v2 probe_joint_matrix
 
 .PHONY: clean run run-sweep run-sweep-llm gate gate-strict
