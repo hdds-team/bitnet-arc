@@ -27,14 +27,24 @@
  * mis-attributes the bottleneck and we burn 3h building the wrong
  * tool.
  *
- * This 80-LOC preliminary forces the question : compare per-WG
- * wall-clock at WG_count = 1 vs WG_count = N.
+ * This 80-LOC preliminary forces the question : compare wall-clock
+ * TOTAL at WG_count = 1 vs WG_count = N (NOT per-WG time -- per-WG
+ * derived as total/N is physically meaningless when the WGs run in
+ * true parallel on the Xe cores ; see post-Arc-B60-run methodology
+ * correction at the end of this file's interpretation guide, and
+ * the per_wg_med diagnostic-only treatment in the run loop).
  *
- *   - per-WG time at N = total_N / N
- *   - if per-WG_1 ~= per-WG_N within noise -> (a) confirmed,
- *     each WG carries ~5 ms of intra-WG work, true parallel exec
- *   - if per-WG_1 << per-WG_N -> (b), there's contention/serialization
- *     that grows with WG count
+ *   - if total_1 ~= total_N within noise -> (a) confirmed, each WG
+ *     carries the same ~5 ms of intra-WG work, single & multi
+ *     finish in the same wall-clock because the WGs run in true
+ *     parallel without serialization.
+ *   - if total_1 >> total_N -> the WGs are NOT all running in
+ *     parallel ; there's healthy scaling, the kernel is bandwidth
+ *     or scheduler-bound, NOT intra-WG.
+ *   - if total_1 < total_N (significantly) -> single is faster than
+ *     multi per wall-clock = unexpected ; suggests inter-WG effect
+ *     (dispatcher serialization, SLM bank contention) -- the
+ *     interpretation (b) of the original framing.
  *
  * Methodology (per @theta review #83 protocol notes)
  * --------------------------------------------------
