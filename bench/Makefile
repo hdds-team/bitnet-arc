@@ -87,6 +87,13 @@ probe_dpas_throughput: probe_dpas_throughput.cpp
 probe_dpas_opencl: probe_dpas_opencl.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) probe_dpas_opencl.cpp -lOpenCL -o $@
 
+# Path 6 probe per docs/research-notes-paths.md: INT4 K=64 builtin
+# (intel_sub_group_i4_i4_matrix_mad_k64). Ternary {-1,0,+1} fits in
+# INT4 trivially; 4x more ops/MMA than FP16 16x16x16. Speedup
+# headroom up to 2.6x vs FP16 if silicon time per MMA stays similar.
+probe_dpas_int4_throughput: probe_dpas_int4_throughput.cpp
+	$(CXX) $(CXXFLAGS) $(INCLUDES) probe_dpas_int4_throughput.cpp -lOpenCL -o $@
+
 # Build dependent libraries on demand.
 $(ORACLE_LIB):
 	$(MAKE) -C ../oracle
