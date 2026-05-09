@@ -77,7 +77,7 @@ The v0 kernel runs 1 work-item per output element with a serial inner
 K-walk. Each work-item issues scalar FMAs only. SIMD lanes inside each
 sub-group execute the *same* op on adjacent outputs — useful — but the
 inner K-loop is a sequential scalar reduction with no vectorization
-across K. That is where the 60× efficiency gap lives: the ALU is
+across K. That is where the ~250× efficiency gap lives: the ALU is
 idle most of the time waiting on its own previous output.
 
 ---
@@ -90,17 +90,18 @@ Design v0 §2.2 disqualified XMX with the rationale "ternary is trivial,
 no need for matrix accel". The hardware data **inverts that
 reasoning**:
 
-- We are 60× off the scalar peak.
+- We are ~250× off the scalar FP32 peak.
 - The kernel is *not* trivial in practice — it is a sequential
   reduction that wastes ALU cycles.
-- XMX (Intel's matrix engine on Xe2) issues one matrix-multiply-and-
-  accumulate per cycle per sub-group, which directly addresses this
-  inefficiency by parallelizing the K-walk reduction.
+- XMX (Intel's matrix engine on Xe2, 160 engines on B60) issues one
+  matrix-multiply-and-accumulate per cycle per sub-group, which
+  directly addresses this inefficiency by parallelizing the K-walk
+  reduction.
 
-Realistic v2 target on this shape: **~5–10× speedup via XMX**, which
-would land us comfortably above the 1.5× gate (and possibly above
-2× depending on how cleanly the ternary codes can be unpacked into the
-XMX operand registers).
+Realistic v2 target on this shape: **5–15× speedup via XMX**,
+upper-bound stretch 50× (still ~5× below the 250× brute ceiling so
+ambitious without being magical thinking). All comfortably above the
+1.5× W2 gate.
 
 ### Disqualified: vec loads, B layout pre-shuffle
 
@@ -114,7 +115,7 @@ With HBM at 0.19% saturation, **memory access is not the bottleneck**.
 These optimizations would not move the needle on this regime. They
 remain valid as second-order optimizations *after* XMX brings compute
 into the same order of magnitude as memory traffic — but they cannot
-unlock the 60× gap on their own.
+unlock the ~250× gap on their own.
 
 ---
 
