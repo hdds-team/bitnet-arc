@@ -44,6 +44,12 @@ profile_v0_bl: profile_v0_bl.cpp $(KERNEL_LIB) $(ORACLE_LIB) $(HEADERS) $(KERNEL
 	$(CXX_SYCL) $(SYCLFLAGS) $(INCLUDES) profile_v0_bl.cpp \
 	    $(KERNEL_LIB) $(ORACLE_LIB) -o $@
 
+# Task #156 / design v2 Phase 0 -- joint_matrix availability probe.
+# Standalone (no kernel_v0 lib needed): only links libc++ + the oracle
+# fp16 helpers via header. Same icpx toolchain.
+probe_joint_matrix: probe_joint_matrix.cpp $(HEADERS)
+	$(CXX_SYCL) $(SYCLFLAGS) $(INCLUDES) probe_joint_matrix.cpp -o $@
+
 # Build dependent libraries on demand.
 $(ORACLE_LIB):
 	$(MAKE) -C ../oracle
@@ -75,6 +81,6 @@ gate-strict:
 	python3 gate_w1w2.py --strict-gates $(GATE_CSV)
 
 clean:
-	rm -f harness_3way sweep_tile profile_v0_bl
+	rm -f harness_3way sweep_tile profile_v0_bl probe_joint_matrix
 
 .PHONY: clean run run-sweep run-sweep-llm gate gate-strict
