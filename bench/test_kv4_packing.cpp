@@ -245,6 +245,76 @@ void test_compute_a_row_max_abs() {
     EXPECT_EQ(int(mx2 * 1000), 1000);
 }
 
+/* --- INT4 packing tests (Phase 1 v4 primary path) ------------------ */
+
+void test_ternary_to_int4_signed() {
+    EXPECT_EQ(ternary_to_int4_signed(-1), 0xFu);
+    EXPECT_EQ(ternary_to_int4_signed( 0), 0x0u);
+    EXPECT_EQ(ternary_to_int4_signed(+1), 0x1u);
+}
+
+void test_pack_b_int4_invariants() {
+    /* All-0 -> all dwords = 0. */
+    std::vector<std::int8_t> ternary(64 * 16, 0);
+    std::uint32_t out[128];
+    pack_b_fragment_vnni_int4(ternary.data(), out);
+    for (unsigned i = 0; i < 128; ++i) EXPECT_EQ(out[i], 0u);
+
+    /* All +1 -> each dword = 0x11111111 (8 nibbles of 0001). */
+    std::fill(ternary.begin(), ternary.end(), 1);
+    pack_b_fragment_vnni_int4(ternary.data(), out);
+    for (unsigned i = 0; i < 128; ++i) EXPECT_EQ(out[i], 0x11111111u);
+
+    /* All -1 -> 0xFFFFFFFF. */
+    std::fill(ternary.begin(), ternary.end(), -1);
+    pack_b_fragment_vnni_int4(ternary.data(), out);
+    for (unsigned i = 0; i < 128; ++i) EXPECT_EQ(out[i], 0xFFFFFFFFu);
+}
+
+void test_pack_b_int4_single_element() {
+    /* ternary[k=5, n=3] = +1, rest = 0. */
+    std::vector<std::int8_t> ternary(64 * 16, 0);
+    ternary[5 * 16 + 3] = 1;
+    std::uint32_t out[128];
+    pack_b_fragment_vnni_int4(ternary.data(), out);
+    /* k=5 -> d=0, bit_pos=(5%8)*4=20. Column n=3 -> out[3]. */
+    EXPECT_EQ(out[3], (0x1u << 20));
+    for (unsigned i = 0; i < 128; ++i) {
+        if (i != 3) EXPECT_EQ(out[i], 0u);
+    }
+
+    /* k=63 -> d=7, bit_pos=(63%8)*4=28. n=15 -> out[7*16+15]=out[127]. */
+    std::fill(ternary.begin(), ternary.end(), 0);
+    ternary[63 * 16 + 15] = -1;
+    pack_b_fragment_vnni_int4(ternary.data(), out);
+    EXPECT_EQ(out[127], (0xFu << 28));
+}
+
+void test_pack_a_int4_quant() {
+    /* a = 1.0 with s_a chosen so q = +7 (max). */
+    std::vector<std::uint16_t> a(8 * 64, f32_to_h(1.0f));
+    float s_a[8];
+    for (unsigned m = 0; m < 8; ++m) s_a[m] = 1.0f;  /* a/s_a = 1, *7 = 7 */
+    std::uint32_t out[64];
+    pack_a_fragment_vnni_int4(a.data(), s_a, out);
+    for (unsigned i = 0; i < 64; ++i) EXPECT_EQ(out[i], 0x77777777u);
+
+    /* a = 0.5 with s_a = 1.0 -> q = round(0.5 * 7) = 4. */
+    std::fill(a.begin(), a.end(), f32_to_h(0.5f));
+    pack_a_fragment_vnni_int4(a.data(), s_a, out);
+    for (unsigned i = 0; i < 64; ++i) EXPECT_EQ(out[i], 0x44444444u);
+
+    /* Clamping: a = 5.0, s_a = 1.0 -> q = 35 -> clamped to 7. */
+    std::fill(a.begin(), a.end(), f32_to_h(5.0f));
+    pack_a_fragment_vnni_int4(a.data(), s_a, out);
+    for (unsigned i = 0; i < 64; ++i) EXPECT_EQ(out[i], 0x77777777u);
+
+    /* Negative: a = -1.0 -> q = -7 -> bits 0x9 (= 1001 = -7 in 4-bit 2's comp). */
+    std::fill(a.begin(), a.end(), f32_to_h(-1.0f));
+    pack_a_fragment_vnni_int4(a.data(), s_a, out);
+    for (unsigned i = 0; i < 64; ++i) EXPECT_EQ(out[i], 0x99999999u);
+}
+
 int main() {
     test_ternary_to_int2_signed_roundtrip();
     test_pack_b_all_zero();
@@ -259,6 +329,11 @@ int main() {
     test_pack_a_per_row_scale();
     test_tq2_0_unpack_all_codes();
     test_compute_a_row_max_abs();
+    /* INT4 path */
+    test_ternary_to_int4_signed();
+    test_pack_b_int4_invariants();
+    test_pack_b_int4_single_element();
+    test_pack_a_int4_quant();
     std::fprintf(stderr, "kv4_packing tests: %d pass, %d fail\n",
                  g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

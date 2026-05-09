@@ -106,6 +106,78 @@ inline float compute_a_row_max_abs(
     return (mx > 0.0f) ? mx : 1.0f;
 }
 
+/* --- INT4 signed encoding (Phase 1 v4 INT4-act primary path) -------- *
+ *
+ * For INT4 packed into dwords: 8 nibbles per int32, each nibble at bit
+ * positions [0..3], [4..7], ..., [28..31]. Position formula:
+ *   dword_idx = k / 8
+ *   bit_pos   = (k % 8) * 4
+ *
+ * Ternary {-1, 0, +1} maps to 4-bit signed bit patterns:
+ *   value -1 → 0xF (= 1111, = -1 in 2's complement 4-bit)
+ *   value  0 → 0x0
+ *   value +1 → 0x1
+ * Activation int4 quant range: round(a/s_a*7) clamped to [-7, +7],
+ * encoded as 2's complement 4-bit (bits = q & 0xF).
+ */
+
+inline std::uint32_t ternary_to_int4_signed(std::int8_t v) {
+    if (v < 0) return 0xFu;
+    if (v > 0) return 0x1u;
+    return 0x0u;
+}
+
+/* Pack a (K=64, N=16) fragment of ternary weights into VNNI INT4
+ * layout. Output: 128 dwords, layout `out[d * 16 + n]` for d in 0..7,
+ * n in 0..15. Each dword holds 8 K-positions × 4 bits.
+ *
+ * Test invariant: input all = 0 → out all 0
+ *                 input all = +1 → out all 0x11111111
+ *                 input all = -1 → out all 0xFFFFFFFF
+ */
+inline void pack_b_fragment_vnni_int4(
+    const std::int8_t* ternary_K64xN16,
+    std::uint32_t out[128])
+{
+    std::memset(out, 0, sizeof(std::uint32_t) * 128);
+    for (unsigned k = 0; k < 64u; ++k) {
+        const unsigned d        = k >> 3u;        /* dword index 0..7 */
+        const unsigned bit_pos  = (k & 7u) * 4u;  /* 0,4,8,...,28 */
+        for (unsigned n = 0; n < 16u; ++n) {
+            const std::int8_t v = ternary_K64xN16[k * 16u + n];
+            const std::uint32_t bits = ternary_to_int4_signed(v);
+            out[d * 16u + n] |= (bits & 0xFu) << bit_pos;
+        }
+    }
+}
+
+/* FP16 → INT4 quant + VNNI pack for A fragment.
+ * Per-row symmetric quant: a_q = round(a/s_a * 7) clamped to [-7, +7].
+ * Output 64 dwords as `out[d * 8 + m]` for d in 0..7, m in 0..7.
+ */
+inline void pack_a_fragment_vnni_int4(
+    const std::uint16_t* a_fp16_M8xK64,
+    const float* s_a_per_row,
+    std::uint32_t out[64])
+{
+    std::memset(out, 0, sizeof(std::uint32_t) * 64);
+    for (unsigned k = 0; k < 64u; ++k) {
+        const unsigned d       = k >> 3u;
+        const unsigned bit_pos = (k & 7u) * 4u;
+        for (unsigned m = 0; m < 8u; ++m) {
+            const float a = bitnet_arc_fp16_to_fp32(
+                a_fp16_M8xK64[m * 64u + k]);
+            const float s = s_a_per_row[m];
+            const float q_f = (s > 0.0f) ? (a / s * 7.0f) : 0.0f;
+            int q = static_cast<int>(std::lround(q_f));
+            if (q < -7) q = -7;
+            if (q >  7) q =  7;
+            const std::uint32_t bits = static_cast<std::uint32_t>(q) & 0xFu;
+            out[d * 8u + m] |= bits << bit_pos;
+        }
+    }
+}
+
 /* --- VNNI INT2 packing for B fragment ------------------------------- *
  *
  * Input: ternary_K64xN16 = (K=64, N=16) row-major INT8 buffer with

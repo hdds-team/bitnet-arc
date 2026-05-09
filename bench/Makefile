@@ -111,6 +111,16 @@ probe_esimd_int2: probe_esimd_int2.cpp
 test_kv4_packing: test_kv4_packing.cpp ../src/kernel_v4_packing.h ../oracle/liboracle.a
 	$(CXX) $(CXXFLAGS) $(INCLUDES) test_kv4_packing.cpp ../oracle/liboracle.a -o $@
 
+# Phase 1 v4 isolated all-zero correctness probe (debug aid).
+test_kv4_zero: test_kv4_zero.cpp $(KERNEL_LIB) $(ORACLE_LIB) ../src/kernel_v4.h
+	$(CXX_SYCL) $(SYCLFLAGS) $(INCLUDES) test_kv4_zero.cpp \
+	    $(KERNEL_LIB) $(ORACLE_LIB) -o $@
+
+# Phase 1 v4 all-1 input correctness probe (manual-calculable expected).
+test_kv4_one: test_kv4_one.cpp $(KERNEL_LIB) $(ORACLE_LIB) ../src/kernel_v4.h ../src/kernel_v4_packing.h
+	$(CXX_SYCL) $(SYCLFLAGS) $(INCLUDES) test_kv4_one.cpp \
+	    $(KERNEL_LIB) $(ORACLE_LIB) -o $@
+
 # Build dependent libraries on demand.
 $(ORACLE_LIB):
 	$(MAKE) -C ../oracle
