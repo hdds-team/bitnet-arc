@@ -8,6 +8,7 @@
 oracle/upstream_gating/gate
 bench/harness_3way
 bench/sweep_tile
+bench/profile_v0_bl
 
 # Test fixtures (regenerated via gen_inputs.py / harness)
 oracle/upstream_gating/inputs/

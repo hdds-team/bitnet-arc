@@ -38,6 +38,12 @@ sweep_tile: sweep_tile.cpp $(KERNEL_LIB) $(ORACLE_LIB) $(HEADERS) $(KERNEL_HDR)
 	$(CXX_SYCL) $(SYCLFLAGS) $(INCLUDES) sweep_tile.cpp \
 	    $(KERNEL_LIB) $(ORACLE_LIB) -o $@
 
+# Task #155 profiler -- v0_BL ablation timing for design v2 input.
+# Same toolchain as sweep_tile (icpx + Arc B60 host).
+profile_v0_bl: profile_v0_bl.cpp $(KERNEL_LIB) $(ORACLE_LIB) $(HEADERS) $(KERNEL_HDR)
+	$(CXX_SYCL) $(SYCLFLAGS) $(INCLUDES) profile_v0_bl.cpp \
+	    $(KERNEL_LIB) $(ORACLE_LIB) -o $@
+
 # Build dependent libraries on demand.
 $(ORACLE_LIB):
 	$(MAKE) -C ../oracle
@@ -69,6 +75,6 @@ gate-strict:
 	python3 gate_w1w2.py --strict-gates $(GATE_CSV)
 
 clean:
-	rm -f harness_3way sweep_tile
+	rm -f harness_3way sweep_tile profile_v0_bl
 
 .PHONY: clean run run-sweep run-sweep-llm gate gate-strict
