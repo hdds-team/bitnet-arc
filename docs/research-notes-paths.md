@@ -97,17 +97,22 @@ All-nibble=1 init for validation:
 - Expected: each acc[m, n] = K*n_reps = 64 * n_reps
 - Per-lane sum (acc.s0..s7) = 8 * 64 * n_reps = **512 * n_reps**
 
-### Path 7 — INT2 path (XMX silicon support, builtin TBD)
+### Path 7 — INT2 path ❌ FAIL (not exposed via OpenCL builtin)
 
-- Intel docs: "XMX units support FP16, BF16, INT8, INT4, INT2" on Xe2
-- Khronos spec public listing INT8 + INT4 only (INT2 perhaps added
-  in later driver versions, untested)
-- For ternary {-1, 0, +1} : 2-bit signed = exactly the data range.
-  No storage waste, no precision loss.
-- **Open question**: is there a `intel_sub_group_i2_i2_matrix_mad_k128`
-  builtin in driver 26.09? Test by compile attempt.
-- If yes: ops/MMA = 8*16*128*2 = 32768 = 8× FP16. Could be the
-  long-promised "8× peak" claim materializing.
+**Tested via compile-attempt probe 2026-05-09** (driver 26.09.37435.1):
+```c
+acc = intel_sub_group_i2_i2_matrix_mad_k128(a, b, acc);
+```
+IGC error: `use of undeclared identifier 'intel_sub_group_i2_i2_matrix_mad_k128'; did you mean 'intel_sub_group_i8_i8_matrix_mad_k32'?`
+
+Conclusion: only INT8 + INT4 + BF16 + FP16 + TF32 builtins are exposed
+in the OpenCL extension as of icpx 2025.3 / driver 26.09. The XMX
+silicon supports INT2 per Intel hardware docs, but it's not accessible
+via this API surface. SPIR-V intrinsic level or inline asm Xe2 would
+be the only paths to access it (= Path 9 territory).
+
+For ternary specifically, INT4 K=64 (Path 6, 2.6× FP16, validated)
+is the practical near-native option since INT2 builtin doesn't exist.
 
 ### Path 8 — `cl_intel_subgroup_2d_block_io` for memory throughput
 
