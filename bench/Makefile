@@ -68,6 +68,12 @@ profile_v2_wg_isolation: profile_v2_wg_isolation.cpp $(KERNEL_LIB) $(ORACLE_LIB)
 probe_joint_matrix: probe_joint_matrix.cpp $(HEADERS)
 	$(CXX_SYCL) $(SYCLFLAGS) $(INCLUDES) probe_joint_matrix.cpp -o $@
 
+# Path A Phase 0 probe (post-v2-falsification): probe INT8 DPAS support
+# on Arc B60 / Xe2. Standalone, no kernel lib dependency. See
+# bench/probe_dpas.cpp header for full rationale + acceptance criteria.
+probe_dpas: probe_dpas.cpp
+	$(CXX_SYCL) $(SYCLFLAGS) $(INCLUDES) probe_dpas.cpp -o $@
+
 # Build dependent libraries on demand.
 $(ORACLE_LIB):
 	$(MAKE) -C ../oracle
@@ -100,6 +106,6 @@ gate-strict:
 
 clean:
 	rm -f harness_3way sweep_tile profile_v0_bl profile_v2 \
-	      profile_v2_wg_isolation probe_joint_matrix
+	      profile_v2_wg_isolation probe_joint_matrix probe_dpas
 
 .PHONY: clean run run-sweep run-sweep-llm gate gate-strict
