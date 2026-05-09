@@ -105,6 +105,12 @@ probe_2d_block_io: probe_2d_block_io.cpp
 probe_esimd_int2: probe_esimd_int2.cpp
 	$(CXX_SYCL) $(SYCLFLAGS) $(INCLUDES) probe_esimd_int2.cpp -o $@
 
+# Phase 1 v4 packing helpers unit tests. CPU-only, no SYCL/OpenCL.
+# Per @naskel design v4 review fold #2: testable host-side before
+# embedding in ESIMD kernel.
+test_kv4_packing: test_kv4_packing.cpp ../src/kernel_v4_packing.h ../oracle/liboracle.a
+	$(CXX) $(CXXFLAGS) $(INCLUDES) test_kv4_packing.cpp ../oracle/liboracle.a -o $@
+
 # Build dependent libraries on demand.
 $(ORACLE_LIB):
 	$(MAKE) -C ../oracle
