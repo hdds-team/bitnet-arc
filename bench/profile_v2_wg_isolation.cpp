@@ -231,7 +231,13 @@ probe_result_t probe_one(sycl::queue& q, sycl_queue_handle& qh,
                                      A_d.get(), B_d.get(), C_d.get(),
                                      warmup, timed);
     const std::size_t wgs = (M / 16) * (N / 16);
-    return probe_result_t{M, N, K, wgs, s, s.t_med / double(wgs)};
+    /* Guard against div-by-zero (per @theta review #85 latent bug
+     * catch). Current probes always have wgs >= 1 since M,N >= 16,
+     * but the guard makes the helper safe to reuse on M<16 or
+     * N<16 inputs in future probes. */
+    const double per_wg = (wgs > 0) ? s.t_med / double(wgs)
+                                    : std::nan("");
+    return probe_result_t{M, N, K, wgs, s, per_wg};
 }
 
 } /* anonymous namespace */
@@ -242,8 +248,15 @@ probe_result_t probe_one(sycl::queue& q, sycl_queue_handle& qh,
 
 int main(int argc, char** argv) {
     /* CLI : same parse_pos_uint helper as profile_v2.cpp (defensive
-     * checks per review #83 fold). */
-    unsigned warmup = 5, timed = 5;
+     * checks per review #83 fold).
+     *
+     * Default `timed = 10` (was 5 pre-#86 fold) per @beta review #85
+     * nit #2 : 5 samples gave a flaky t_std estimate, which matters
+     * because the variance comparison single-vs-multi is itself a
+     * load-bearing signal in the interpretation (single WG = expected
+     * higher jitter). 10 timed runs keeps the bench under ~250 ms
+     * total on Arc B60 (10 iters x 4 probes x ~5 ms each). */
+    unsigned warmup = 5, timed = 10;
     std::uint32_t seed = 1337;
 
     auto parse_pos_uint = [](const char* s, const char* name,
@@ -281,7 +294,7 @@ int main(int argc, char** argv) {
         else if (a == "--help") {
             std::printf(
                 "usage: %s [--warmup N] [--timed N] [--seed N]\n"
-                "  default: 5 warmup + 5 timed iters per probe, seed=1337.\n"
+                "  default: 5 warmup + 10 timed iters per probe, seed=1337.\n"
                 "  Runs kernel_v2 single-WG (M=16,N=16) vs multi-WG\n"
                 "  (M=64,N=256, 64 WGs) for K in {4096, 14336}.\n",
                 argv[0]);
@@ -325,13 +338,18 @@ int main(int argc, char** argv) {
         const probe_result_t multi  = probe_one(q, qh, 64, 256, p.K,
                                                 seed, warmup, timed);
 
+        /* Ratio uses NaN sentinel for "cannot compute" (per @beta
+         * review #85 nit #1 -- previously 0.0 silently fell into the
+         * "<0.7 inter-WG contention" interpretation band, hiding a
+         * data-corruption case as a misleading kernel diagnosis). */
         const double ratio = (multi.per_wg_med > 0.0)
                              ? single.per_wg_med / multi.per_wg_med
-                             : 0.0;
+                             : std::nan("");
 
-        /* CSV : single row (no ratio, NaN), then multi row (with ratio
-         * vs single). The caveat column flags single-WG launch-latency
-         * bias. */
+        /* CSV : single row (no ratio, "nan" literal for parser-portable
+         * sentinel per @theta review #85 nit), then multi row (ratio
+         * computed or "nan" if invalid). The caveat column flags
+         * single-WG launch-latency bias. */
         std::printf("%zu,single,%zu,%zu,%zu,"
                     "%.5f,%.5f,%.5f,%.5f,%.5f,"
                     "%.5f,nan,launch_latency_visible\n",
@@ -340,14 +358,25 @@ int main(int argc, char** argv) {
                     single.stats.t_mean, single.stats.t_std,
                     single.stats.t_max,
                     single.per_wg_med);
-        std::printf("%zu,multi,%zu,%zu,%zu,"
-                    "%.5f,%.5f,%.5f,%.5f,%.5f,"
-                    "%.5f,%.4f,launch_latency_amortized\n",
-                    p.K, multi.M, multi.N, multi.wg_count,
-                    multi.stats.t_min, multi.stats.t_med,
-                    multi.stats.t_mean, multi.stats.t_std,
-                    multi.stats.t_max,
-                    multi.per_wg_med, ratio);
+        if (std::isnan(ratio)) {
+            std::printf("%zu,multi,%zu,%zu,%zu,"
+                        "%.5f,%.5f,%.5f,%.5f,%.5f,"
+                        "%.5f,nan,launch_latency_amortized\n",
+                        p.K, multi.M, multi.N, multi.wg_count,
+                        multi.stats.t_min, multi.stats.t_med,
+                        multi.stats.t_mean, multi.stats.t_std,
+                        multi.stats.t_max,
+                        multi.per_wg_med);
+        } else {
+            std::printf("%zu,multi,%zu,%zu,%zu,"
+                        "%.5f,%.5f,%.5f,%.5f,%.5f,"
+                        "%.5f,%.4f,launch_latency_amortized\n",
+                        p.K, multi.M, multi.N, multi.wg_count,
+                        multi.stats.t_min, multi.stats.t_med,
+                        multi.stats.t_mean, multi.stats.t_std,
+                        multi.stats.t_max,
+                        multi.per_wg_med, ratio);
+        }
         std::fflush(stdout);
 
         /* stderr summary per K. */
