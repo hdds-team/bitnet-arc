@@ -121,6 +121,13 @@ test_kv4_one: test_kv4_one.cpp $(KERNEL_LIB) $(ORACLE_LIB) ../src/kernel_v4.h ..
 	$(CXX_SYCL) $(SYCLFLAGS) $(INCLUDES) test_kv4_one.cpp \
 	    $(KERNEL_LIB) $(ORACLE_LIB) -o $@
 
+# kv4 W1 with quant-aware oracle (proves kernel correct vs its own
+# intentional INT2/INT4 approximation, isolating from sweep_tile FP32
+# oracle's quant-noise sensitivity).
+test_kv4_quant_oracle: test_kv4_quant_oracle.cpp $(KERNEL_LIB) $(ORACLE_LIB) ../src/kernel_v4.h ../src/kernel_v4_packing.h
+	$(CXX_SYCL) $(SYCLFLAGS) $(INCLUDES) test_kv4_quant_oracle.cpp \
+	    $(KERNEL_LIB) $(ORACLE_LIB) -o $@
+
 # Build dependent libraries on demand.
 $(ORACLE_LIB):
 	$(MAKE) -C ../oracle

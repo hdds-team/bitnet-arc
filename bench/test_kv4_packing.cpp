@@ -82,12 +82,11 @@ void test_pack_b_single_element() {
     ternary[5 * 16 + 3] = 1;
     std::uint32_t out[64];
     pack_b_fragment_vnni_int2(ternary.data(), out);
-    /* k=5 is in dword d=0 (k<16), at bit pos (5%16)*2 = 10.
-     * Column n=3 is at out[d*16 + n] = out[3]. */
-    EXPECT_EQ(out[3], (0x1u << 10));
-    /* All other 63 dwords must be zero. */
+    /* k=5 -> d=0 (k<16), bit_pos = (5%16)*2 = 10.
+     * VNNI column-major: column n=3, dword d=0 -> out[n*4 + d] = out[12]. */
+    EXPECT_EQ(out[12], (0x1u << 10));
     for (unsigned i = 0; i < 64; ++i) {
-        if (i != 3) EXPECT_EQ(out[i], 0u);
+        if (i != 12) EXPECT_EQ(out[i], 0u);
     }
 }
 
@@ -97,10 +96,11 @@ void test_pack_b_dword_boundary() {
     ternary[16 * 16 + 7] = -1;
     std::uint32_t out[64];
     pack_b_fragment_vnni_int2(ternary.data(), out);
-    /* k=16 -> d=1, bit_pos = (16%16)*2 = 0. Column n=7 -> out[1*16+7]=out[23]. */
-    EXPECT_EQ(out[23], 0x3u);  /* low 2 bits set to 11 */
+    /* k=16 -> d=1, bit_pos = (16%16)*2 = 0.
+     * VNNI: out[n*4 + d] = out[7*4 + 1] = out[29]. */
+    EXPECT_EQ(out[29], 0x3u);
     for (unsigned i = 0; i < 64; ++i) {
-        if (i != 23) EXPECT_EQ(out[i], 0u);
+        if (i != 29) EXPECT_EQ(out[i], 0u);
     }
 }
 
@@ -110,10 +110,10 @@ void test_pack_b_last_dword() {
     ternary[63 * 16 + 0] = 1;
     std::uint32_t out[64];
     pack_b_fragment_vnni_int2(ternary.data(), out);
-    /* k=63 -> d=3, bit_pos = (63%16)*2 = 30. n=0 -> out[3*16+0]=out[48]. */
-    EXPECT_EQ(out[48], (0x1u << 30));
+    /* k=63 -> d=3, bit_pos = (63%16)*2 = 30. n=0 -> out[0*4+3]=out[3]. */
+    EXPECT_EQ(out[3], (0x1u << 30));
     for (unsigned i = 0; i < 64; ++i) {
-        if (i != 48) EXPECT_EQ(out[i], 0u);
+        if (i != 3) EXPECT_EQ(out[i], 0u);
     }
 }
 
@@ -181,10 +181,10 @@ void test_pack_a_per_row_scale() {
     std::uint32_t out[32];
     pack_a_fragment_vnni_int2(a.data(), s_a, out);
     /* For row m, q=1, all dwords for that m = 0x55555555.
-     * Layout: out[d*8 + m]. */
-    for (unsigned d = 0; d < 4; ++d) {
-        for (unsigned m = 0; m < 8; ++m) {
-            EXPECT_EQ(out[d * 8 + m], 0x55555555u);
+     * Layout VNNI row-major: out[m*4 + d]. */
+    for (unsigned m = 0; m < 8; ++m) {
+        for (unsigned d = 0; d < 4; ++d) {
+            EXPECT_EQ(out[m * 4 + d], 0x55555555u);
         }
     }
 }
@@ -277,13 +277,14 @@ void test_pack_b_int4_single_element() {
     ternary[5 * 16 + 3] = 1;
     std::uint32_t out[128];
     pack_b_fragment_vnni_int4(ternary.data(), out);
-    /* k=5 -> d=0, bit_pos=(5%8)*4=20. Column n=3 -> out[3]. */
-    EXPECT_EQ(out[3], (0x1u << 20));
+    /* k=5 -> d=0, bit_pos=(5%8)*4=20.
+     * VNNI column-major: out[n*8 + d] = out[3*8 + 0] = out[24]. */
+    EXPECT_EQ(out[24], (0x1u << 20));
     for (unsigned i = 0; i < 128; ++i) {
-        if (i != 3) EXPECT_EQ(out[i], 0u);
+        if (i != 24) EXPECT_EQ(out[i], 0u);
     }
 
-    /* k=63 -> d=7, bit_pos=(63%8)*4=28. n=15 -> out[7*16+15]=out[127]. */
+    /* k=63 -> d=7, bit_pos=(63%8)*4=28. n=15 -> out[15*8+7]=out[127]. */
     std::fill(ternary.begin(), ternary.end(), 0);
     ternary[63 * 16 + 15] = -1;
     pack_b_fragment_vnni_int4(ternary.data(), out);

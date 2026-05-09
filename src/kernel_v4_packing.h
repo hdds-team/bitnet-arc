@@ -128,8 +128,11 @@ inline std::uint32_t ternary_to_int4_signed(std::int8_t v) {
 }
 
 /* Pack a (K=64, N=16) fragment of ternary weights into VNNI INT4
- * layout. Output: 128 dwords, layout `out[d * 16 + n]` for d in 0..7,
- * n in 0..15. Each dword holds 8 K-positions × 4 bits.
+ * column-major layout (per design v4 sec3.5 + @naskel review fix
+ * 2026-05-09): for each N column, 8 dwords contiguous in the simd
+ * vector. So out[n*8 + d] for n in 0..15, d in 0..7.
+ *
+ * Each dword still holds 8 K-positions × 4 bits at bit_pos = (k%8)*4.
  *
  * Test invariant: input all = 0 → out all 0
  *                 input all = +1 → out all 0x11111111
@@ -146,14 +149,15 @@ inline void pack_b_fragment_vnni_int4(
         for (unsigned n = 0; n < 16u; ++n) {
             const std::int8_t v = ternary_K64xN16[k * 16u + n];
             const std::uint32_t bits = ternary_to_int4_signed(v);
-            out[d * 16u + n] |= (bits & 0xFu) << bit_pos;
+            out[n * 8u + d] |= (bits & 0xFu) << bit_pos;
         }
     }
 }
 
-/* FP16 → INT4 quant + VNNI pack for A fragment.
+/* FP16 → INT4 quant + VNNI pack for A fragment (row-major: per M row,
+ * 8 dwords contiguous = out[m * 8 + d] per design v4 sec3.5 + fix).
+ *
  * Per-row symmetric quant: a_q = round(a/s_a * 7) clamped to [-7, +7].
- * Output 64 dwords as `out[d * 8 + m]` for d in 0..7, m in 0..7.
  */
 inline void pack_a_fragment_vnni_int4(
     const std::uint16_t* a_fp16_M8xK64,
@@ -173,7 +177,7 @@ inline void pack_a_fragment_vnni_int4(
             if (q < -7) q = -7;
             if (q >  7) q =  7;
             const std::uint32_t bits = static_cast<std::uint32_t>(q) & 0xFu;
-            out[d * 8u + m] |= bits << bit_pos;
+            out[m * 8u + d] |= bits << bit_pos;
         }
     }
 }
@@ -198,6 +202,8 @@ inline void pack_b_fragment_vnni_int2(
     const std::int8_t* ternary_K64xN16,
     std::uint32_t out[64])
 {
+    /* VNNI column-major (per design v4 sec3.5 + fix): for each N column,
+     * 4 dwords contiguous in simd<int, 64> -> out[n*4 + d]. */
     std::memset(out, 0, sizeof(std::uint32_t) * 64);
     for (unsigned k = 0; k < 64u; ++k) {
         const unsigned d        = k >> 4u;       /* dword index 0..3 */
@@ -205,7 +211,7 @@ inline void pack_b_fragment_vnni_int2(
         for (unsigned n = 0; n < 16u; ++n) {
             const std::int8_t v = ternary_K64xN16[k * 16u + n];
             const std::uint32_t bits = ternary_to_int2_signed(v);
-            out[d * 16u + n] |= (bits & 0x3u) << bit_pos;
+            out[n * 4u + d] |= (bits & 0x3u) << bit_pos;
         }
     }
 }
@@ -226,6 +232,8 @@ inline void pack_a_fragment_vnni_int2(
     const float* s_a_per_row,
     std::uint32_t out[32])
 {
+    /* VNNI row-major (per design v4 sec3.5 + fix): for each M row,
+     * 4 dwords contiguous in simd<int, 32> -> out[m*4 + d]. */
     std::memset(out, 0, sizeof(std::uint32_t) * 32);
     for (unsigned k = 0; k < 64u; ++k) {
         const unsigned d       = k >> 4u;
@@ -241,7 +249,7 @@ inline void pack_a_fragment_vnni_int2(
             if (q >  1) q =  1;
             const std::uint32_t bits =
                 ternary_to_int2_signed(static_cast<std::int8_t>(q));
-            out[d * 8u + m] |= (bits & 0x3u) << bit_pos;
+            out[m * 4u + d] |= (bits & 0x3u) << bit_pos;
         }
     }
 }

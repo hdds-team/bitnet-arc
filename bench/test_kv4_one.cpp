@@ -57,14 +57,21 @@ int main() {
     std::vector<std::uint16_t> A_one(M * K, one_h);
     q.memcpy(A_dev, A_one.data(), A_one.size() * sizeof(std::uint16_t)).wait();
 
-    /* All-+1 ternary B with d=1.0:
-     * In TQ2_0 convention (oracle/tq2_0.c): code 2 -> ternary +1.
-     * 4 codes per byte (2 bits each), so all-+1 = each byte = 0xAA
-     * (bits 10101010 = 4 codes of 2). */
+    /* All-+1 ternary B EXCEPT k=0 of column n=0 set to -1.
+     * TQ2_0: byte = (k>>7)*32 + (k&31), shift = ((k>>5)&3)*2.
+     * For k=0: byte=0, shift=0 -> low 2 bits of qs[0].
+     * To get code 0 (= ternary -1) at k=0: low 2 bits of qs[0] = 00.
+     * Other codes in byte 0 (k=1,2,3 etc., shifts up) = 2 (= +1) -> 0xA8.
+     */
     std::vector<bitnet_arc_tq2_0_block> B_one((K / 256) * N);
-    for (auto& blk : B_one) {
+    for (std::size_t i = 0; i < B_one.size(); ++i) {
+        auto& blk = B_one[i];
         blk.d = bitnet_arc_fp32_to_fp16(1.0f);
-        std::memset(blk.qs, 0xAA, sizeof(blk.qs));  /* every code = 2 = ternary +1 */
+        std::memset(blk.qs, 0xAA, sizeof(blk.qs));  /* default all +1 */
+        if (i == 0) {
+            /* For column 0 only: set k=0 to -1. */
+            blk.qs[0] = 0xA8;  /* low 2 bits = 00 = code 0 = ternary -1 */
+        }
     }
     q.memcpy(B_dev, B_one.data(), B_one.size() * sizeof(bitnet_arc_tq2_0_block)).wait();
 
@@ -79,40 +86,38 @@ int main() {
                  "host ternary unpack: %d +1, %d 0, %d -1 (expected 256 +1)\n",
                  n_pos, n_zero, n_neg);
 
-    /* Run kv4. */
-    bitnet_arc::run_kernel_v4(qh, M, N, K, A_dev, B_dev, C_dev);
+    /* Run kv4 INT4 act variant (variant index 0 = primary). */
+    bitnet_arc::kv4_variants[0].launch(qh, M, N, K, A_dev, B_dev, C_dev);
 
     std::vector<std::uint16_t> C_host(M * N);
     q.memcpy(C_host.data(), C_dev, C_host.size() * sizeof(std::uint16_t)).wait();
 
-    /* Convert + analyze */
-    const float expected = 256.0f;
-    int n_match = 0, n_zero_out = 0;
-    float min_v = 1e30f, max_v = -1e30f;
-    float sum_v = 0.0f;
-    for (auto v : C_host) {
-        const float f = bitnet_arc_fp16_to_fp32(v);
-        if (f == expected) ++n_match;
-        if (v == 0) ++n_zero_out;
-        if (f < min_v) min_v = f;
-        if (f > max_v) max_v = f;
-        sum_v += f;
-    }
-    const float mean = sum_v / float(C_host.size());
+    /* Expected pattern (single -1 at B[k=0, n=0], rest +1, A all +1):
+     *   c[m, 0]   = sum_k(a*b)= -1 + 255*1 = 254 for ALL m
+     *   c[m, n>0] = 256 for all m
+     * So column 0 should be all 254, columns 1..15 all 256. */
     std::fprintf(stderr,
-                 "all-1 test M=%zu N=%zu K=%zu: expected 256.0\n"
-                 "  matches: %d/%zu, zero outputs: %d\n"
-                 "  min=%.2f max=%.2f mean=%.2f\n"
-                 "  first 16 outputs (FP32):  ",
-                 M, N, K, n_match, C_host.size(), n_zero_out, min_v, max_v, mean);
-    for (unsigned i = 0; i < 16; ++i) {
-        std::fprintf(stderr, "%.1f ", bitnet_arc_fp16_to_fp32(C_host[i]));
+                 "single-elem test: expected col 0 = 254, cols 1..15 = 256\n");
+    int wrong = 0;
+    for (unsigned m = 0; m < M; ++m) {
+        std::fprintf(stderr, "  row %u: ", m);
+        for (unsigned n = 0; n < N; ++n) {
+            const float f = bitnet_arc_fp16_to_fp32(C_host[m * N + n]);
+            std::fprintf(stderr, "%6.1f ", f);
+            const float expect_val = (n == 0) ? 254.0f : 256.0f;
+            if (std::fabs(f - expect_val) > 0.5f) ++wrong;
+        }
+        std::fprintf(stderr, "\n");
+        if (m == 1) {
+            std::fprintf(stderr, "  ... (rows 2..%zu suppressed)\n", M - 1);
+            break;
+        }
     }
-    std::fprintf(stderr, "\n");
+    std::fprintf(stderr, "  total wrong (out of %zu): %d\n", M * N, wrong);
 
     sycl::free(A_dev, q);
     sycl::free(B_dev, q);
     sycl::free(C_dev, q);
 
-    return n_match == int(C_host.size()) ? 0 : 1;
+    return wrong == 0 ? 0 : 1;
 }
