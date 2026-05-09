@@ -74,6 +74,12 @@ probe_joint_matrix: probe_joint_matrix.cpp $(HEADERS)
 probe_dpas: probe_dpas.cpp
 	$(CXX_SYCL) $(SYCLFLAGS) $(INCLUDES) probe_dpas.cpp -o $@
 
+# Path A Phase 0.5 hardstop gate (per docs/design-v3.md sec6.0):
+# validate INT8 DPAS throughput vs FP16 joint_matrix baseline.
+# >=4x = PASS, 2-4x = MARGINAL, <2x = FAIL (escalate v4).
+probe_dpas_throughput: probe_dpas_throughput.cpp
+	$(CXX_SYCL) $(SYCLFLAGS) $(INCLUDES) probe_dpas_throughput.cpp -o $@
+
 # Build dependent libraries on demand.
 $(ORACLE_LIB):
 	$(MAKE) -C ../oracle
