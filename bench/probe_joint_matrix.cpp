@@ -129,9 +129,14 @@ combo_result probe_combo(sycl::queue& q,
         q.memcpy(dB, B_dev.data(), B_dev.size() * sizeof(TOp)).wait();
         q.memcpy(dC, C_dev.data(), C_dev.size() * sizeof(TAcc)).wait();
         q.submit([&](sycl::handler& h) {
+            /* nd_range<1>({16},{16}) -> 1 WG = 1 SG of 16 lanes = exactly
+             * what joint_matrix<16,16,16> expects. The earlier
+             * nd_range<2>({16,16},{16,16}) launched 16 sub-groups all
+             * writing the same dC -- correct values but UB per SYCL
+             * spec (caught by @sonnet review #75). */
             h.parallel_for(
-                sycl::nd_range<2>({MX_DIM, MX_DIM}, {MX_DIM, MX_DIM}),
-                [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
+                sycl::nd_range<1>({MX_DIM}, {MX_DIM}),
+                [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
                     sycl::sub_group sg = it.get_sub_group();
 
                     mx::joint_matrix<sycl::sub_group, TOp,  mx::use::a,
