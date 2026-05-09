@@ -128,15 +128,11 @@ inline std::uint32_t ternary_to_int4_signed(std::int8_t v) {
 }
 
 /* Pack a (K=64, N=16) fragment of ternary weights into VNNI INT4
- * column-major layout (per design v4 sec3.5 + @naskel review fix
- * 2026-05-09): for each N column, 8 dwords contiguous in the simd
- * vector. So out[n*8 + d] for n in 0..15, d in 0..7.
+ * vertical layout per Intel/llvm dpas_common.hpp:
+ *   PackedRow = k / 8  (32/4 = 8 elems/dword for INT4)
+ *   PackedLinearIndex = PackedRow * N + n = d * 16 + n
  *
- * Each dword still holds 8 K-positions × 4 bits at bit_pos = (k%8)*4.
- *
- * Test invariant: input all = 0 → out all 0
- *                 input all = +1 → out all 0x11111111
- *                 input all = -1 → out all 0xFFFFFFFF
+ * Each dword holds 8 K-positions × 4 bits.
  */
 inline void pack_b_fragment_vnni_int4(
     const std::int8_t* ternary_K64xN16,
@@ -149,7 +145,7 @@ inline void pack_b_fragment_vnni_int4(
         for (unsigned n = 0; n < 16u; ++n) {
             const std::int8_t v = ternary_K64xN16[k * 16u + n];
             const std::uint32_t bits = ternary_to_int4_signed(v);
-            out[n * 8u + d] |= (bits & 0xFu) << bit_pos;
+            out[d * 16u + n] |= (bits & 0xFu) << bit_pos;
         }
     }
 }
@@ -202,8 +198,11 @@ inline void pack_b_fragment_vnni_int2(
     const std::int8_t* ternary_K64xN16,
     std::uint32_t out[64])
 {
-    /* VNNI column-major (per design v4 sec3.5 + fix): for each N column,
-     * 4 dwords contiguous in simd<int, 64> -> out[n*4 + d]. */
+    /* B VNNI vertical packing per Intel/llvm dpas_common.hpp:
+     *   PackedRow = k / 16  (= dword index for INT2: 32/2 = 16 elems/dword)
+     *   PackedLinearIndex = PackedRow * N + col = d * 16 + n
+     * Layout: VNNI-group-major then N-col within group.
+     * (@naskel review #2 with Intel source verification 2026-05-09.) */
     std::memset(out, 0, sizeof(std::uint32_t) * 64);
     for (unsigned k = 0; k < 64u; ++k) {
         const unsigned d        = k >> 4u;       /* dword index 0..3 */
@@ -211,7 +210,7 @@ inline void pack_b_fragment_vnni_int2(
         for (unsigned n = 0; n < 16u; ++n) {
             const std::int8_t v = ternary_K64xN16[k * 16u + n];
             const std::uint32_t bits = ternary_to_int2_signed(v);
-            out[n * 4u + d] |= (bits & 0x3u) << bit_pos;
+            out[d * 16u + n] |= (bits & 0x3u) << bit_pos;
         }
     }
 }
